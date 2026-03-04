@@ -1,0 +1,11 @@
+# All tests done on Thinkpad P14s Gen 5
+# CPU: Intel Core Ultra 9 185H
+# RAM: 64GB DDR5-5600
+# All fans on maximum for duration of test
+# All tests done on Test Order 15 (15 boxes)
+
+ADDITION,                       TIME TO COMPLETE(min), (sec),       NODES COMPUTED,         AVG NODES/SECOND,        NOTES  
+
+"BnB Algorithm",                17,03,                              4354054,                4462,
+"FFD score initialization",     16,45,                              4349175,                4374,
+"Bounding case 2",
