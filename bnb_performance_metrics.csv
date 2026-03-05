@@ -9,4 +9,4 @@ ADDITION,                       TIME TO COMPLETE(min), (sec),       NODES COMPUT
 "BnB Algorithm",                17,03,                              4354054,                4462,
 "FFD score initialization",     16,45,                              4349175,                4374,
 "Bounding case 2",              17,38,                              4349175,                4243,                   "No improvements due to bounding rule 2 never triggering."
-"Bounding case 2 refinement",   
+"Bounding case 2 refinement",   16,49,                              4349175,                4360,                   "No improvement due to rule 2 still not being aggresive enough."
