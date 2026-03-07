@@ -4,9 +4,11 @@
 # All fans on maximum for duration of test
 # All tests done on Test Order 15 (15 boxes)
 
-ADDITION,                       TIME TO COMPLETE(min), (sec),       NODES COMPUTED,         AVG NODES/SECOND,       NOTES  
+"ADDITION",                     "TIME_TO_COMPLETE(min)", "(sec)",   "NODES_COMPUTED",       "AVG_NODES_PER_SECOND", BEST_SCORE, "PRUNED_RULE1",     "PRUNED_RULE2", "PRUNED_RULE3", NOTES  
 
-"BnB Algorithm",                17,03,                              4354054,                4462,
-"FFD score initialization",     16,45,                              4349175,                4374,
-"Bounding case 2",              17,38,                              4349175,                4243,                   "No improvements due to bounding rule 2 never triggering."
-"Bounding case 2 refinement",   16,49,                              4349175,                4360,                   "No improvement due to rule 2 still not being aggresive enough."
+"BnB Algorithm",                17,03,                              4354054,                4462,                   260,        4354051,            0,              0,
+"FFD score initialization",     16,45,                              4349175,                4374,                   260,        4349174,            0,              0,
+"Bounding case 2",              17,38,                              4349175,                4243,                   260,        4349174,            0,              0,              "No improvements due to bounding rule 2 never triggering."
+"Bounding case 2 refinement",   16,49,                              4349175,                4360,                   260,        4349174,            0,              0,              "No improvement due to rule 2 still not being aggresive enough."
+"Bounding case 3",              17,02,                              4349175,                4327,                   260,        4248711,            0,              0,              "Bounding rule 3 also does not fire"
+"Bounding case 4",              
