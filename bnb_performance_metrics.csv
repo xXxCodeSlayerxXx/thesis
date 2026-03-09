@@ -4,13 +4,13 @@
 # All fans on maximum for duration of test
 # All tests done on Test Order 15 (15 boxes)
 
-"ADDITION","TIME_TO_COMPLETE(min)","(sec)","NODES_COMPUTED","AVG_NPS",BEST_SCORE,"PRUNED_RULE1","PRUNED_RULE2","PRUNED_RULE3","PRUNED_RULE4",NOTES
+"ADDITION","TIME_TO_COMPLETE(min)","(sec)","NODES_COMPUTED","AVG_NPS",BEST_SCORE,"PRUNED_RULE1","PRUNED_RULE2","PRUNED_RULE3","PRUNED_RULE4","PRUNED_DEDUP",NOTES
 
 "BnB Algorithm",17,03,4354054,4462,260,4354051,0,0,0,
-"FFD score initialization",16,45,4349175,4374,260,4349171,0,0,0,"Extremely slight improvement due to high score usually being found fast enough without warm start"
-"Bounding rule 2 (volume)",17,38,4349175,4243,260,4349171,0,0,0,"No improvements due to bounding rule 2 never triggering."
-"Bounding rule 2 refinement",16,49,4349175,4360,260,4349171,0,0,0,"No improvement due to rule 2 still not being aggresive enough."
-"Bounding rule 3 (look-ahead)",17,02,4349175,4327,260,4248711,0,0,0,"Bounding rule 3 also does not fire"
-"Bounding rule 4 (tall-low)",13,17,2122024,2745,260,2021560,0,0,50004,"Rule 4 does a magnificent job of pruning branches early, leading to a faster finish even with almost a third slower nodes per second processing speed"
-"Rule 2 final form",13,55,22122024,2576,260,2021560,0,0,50004,"Rule 2 update has still not made it fire once."
-"Deduplication rule addition",
+"FFD score initialization",16,45,4349175,4374,260,4349171,0,0,0,,"Extremely slight improvement due to high score usually being found fast enough without warm start"
+"Bounding rule 2 (volume)",17,38,4349175,4243,260,4349171,0,0,0,,"No improvements due to bounding rule 2 never triggering."
+"Bounding rule 2 refinement",16,49,4349175,4360,260,4349171,0,0,0,,"No improvement due to rule 2 still not being aggresive enough."
+"Bounding rule 3 (look-ahead)",17,02,4349175,4327,260,4248711,0,0,0,,"Bounding rule 3 also does not fire."
+"Bounding rule 4 (tall-low)",13,17,2122024,2745,260,2021560,0,0,50004,,"Rule 4 does a magnificent job of pruning branches early, leading to a faster finish even with almost a third slower nodes per second processing speed."
+"Rule 2 final form",13,55,22122024,2576,260,2021560,0,0,50004,,"Rule 2 update has still not made it fire once."
+"Deduplication rule addition",00,29,188559,1714,260,16673,0,0,664,21378,"An incredible optimization. Now to check whether the results are much more unoptimal or not."
