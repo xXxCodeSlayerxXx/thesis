@@ -9,8 +9,6 @@ import copy as cp
 import numpy as np
 import pandas as pd
 from enum import Enum
-import sklearn as skl
-import skimage as ski
 import matplotlib.pyplot as plt
 
 if NOTEBOOK_MODE == True:
@@ -601,11 +599,6 @@ class Pallet:
         
         return score
 
-    # ML-related methods
-    def get_observation(self, scale_factor=ML_OBSERVATION_SCALE_FACTOR):        # Get a downscaled resolution view of the height map for ML
-        # Use block_reduce from scikit-image to scale down heightmap, making sure to take the max so the model knows the top.
-        observation = ski.measure.block_reduce(self.heightmap, block_size=(scale_factor, scale_factor), func=np.max)
-        return observation
 
 # %% [markdown]
 # #### Helper Functions
@@ -1196,6 +1189,6 @@ current_metric = Metric.MAX_Z
 #     testpallet = process_order(current_orderID, algo=current_algo, criterion=current_criterion, order_dict=current_order_dict, metric=current_metric)
 #     testpallet.get_pallet_results(current_algo, current_orderID, current_order_dict, print_mode=True)
 
-run_optimality_guarantee_test(start_order=14, end_order=15, order_dict=test_orders_dict)
+run_optimality_guarantee_test(start_order=1401, end_order=1550, order_dict=test_orders_dict)
 
 
