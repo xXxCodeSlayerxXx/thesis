@@ -1104,7 +1104,7 @@ def run_optimality_guarantee_test(start_order=1, end_order=None, order_dict=test
             leave_tqdm=False, optimality_guarantee=False
         )
         score_no_guarantee = pallet_no_guarantee.get_max_height() if metric == Metric.MAX_Z else None
-        pallet_no_guarantee.get_pallet_results(algo=Algorithm.BNB, order_dict=order_dict, print_mode=False, save_mode=True, bnb_stats=stats_no_guarantee)
+        pallet_no_guarantee.get_pallet_results(algo=Algorithm.BNB, orderID=order_id, order_dict=order_dict, print_mode=False, save_mode=True, bnb_stats=stats_no_guarantee)
 
         print(f"\n----------------------------------------------------------------------------------------------------------------------------")
         print(f"\nRunning order {order_id} with guarantee on...")
@@ -1117,7 +1117,7 @@ def run_optimality_guarantee_test(start_order=1, end_order=None, order_dict=test
             leave_tqdm=False, optimality_guarantee=True
         )
         score_with_guarantee = pallet_with_guarantee.get_max_height() if metric == Metric.MAX_Z else None
-        pallet_no_guarantee.get_pallet_results(algo=Algorithm.BNB, order_dict=order_dict, print_mode=False, save_mode=True, bnb_stats=stats_with_guarantee)
+        pallet_no_guarantee.get_pallet_results(algo=Algorithm.BNB, orderID=order_id, order_dict=order_dict, print_mode=False, save_mode=True, bnb_stats=stats_with_guarantee)
 
         # Calculate differences, absolute and relative
         def calculate_row_difference(val_no_guarantee, val_with_guarantee):
