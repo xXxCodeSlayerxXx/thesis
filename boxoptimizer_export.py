@@ -54,7 +54,6 @@ SUPPORTED_AREA_PERCENTAGE = 70                                                  
 HOR_ROTATION_ALLOWED_DEFAULT = True                                             # Default value of whether boxes may be rotated horizontally
 VER_ROTATION_ALLOWED_DEFAULT = True                                             # Default value of whether boxes may be rotated vertically
 BNB_OPTIMALITY_GUARANTEE = False                                                # Disable any code that would sacrifice the guarantee that the BnB algorithm's outcome is the optimal one
-NOTEBOOK_MODE = True                                                            # Toggle for 
 
 # %% [markdown]
 # #### Data loading and precomputing
@@ -1079,7 +1078,7 @@ def plot_random_performance(trials, max_max_attempts, step):                    
 
     plt.show()
 
-def run_optimality_guarantee_test(start_order=1, end_order=None, order_dict=test_orders_dict, criterion=DEFAULT_CRITERION, metric=Metric.MAX_Z, output_csv="bnb_guarantee_comparison.csv"):    # Run BnB with and without the optimality guarantee on a range of orders and export a comparison CSV
+def run_optimality_guarantee_test(start_order=1, end_order=None, order_dict=test_orders_dict, criterion=DEFAULT_CRITERION, metric=Metric.MAX_Z, output_csv="bnb_guarantee_comparison.csv", print_pallets=False, save_pallets=False):    # Run BnB with and without the optimality guarantee on a range of orders and export a comparison CSV
 
     # If no final order is specified, let the final order be the last entry in the dict
     if end_order is None:
@@ -1093,7 +1092,7 @@ def run_optimality_guarantee_test(start_order=1, end_order=None, order_dict=test
     for order_id in tqdm(order_ids, desc="Testing orders", unit=" orders"):
         print(f"\n----------------------------------------------------------------------------------------------------------------------------")
         print(f"----------------------------------------------------------------------------------------------------------------------------")
-        print(f"\nRunning order {order_id} with guarantee off...")
+        print(f"Running order {order_id} with guarantee off...")
 
         # Run order with no optimality guarantee and save image
         pallet_no_guarantee = Pallet()
@@ -1104,10 +1103,10 @@ def run_optimality_guarantee_test(start_order=1, end_order=None, order_dict=test
             leave_tqdm=False, optimality_guarantee=False
         )
         score_no_guarantee = pallet_no_guarantee.get_max_height() if metric == Metric.MAX_Z else None
-        pallet_no_guarantee.get_pallet_results(algo=Algorithm.BNB, orderID=order_id, order_dict=order_dict, print_mode=False, save_mode=True, bnb_stats=stats_no_guarantee)
+        pallet_no_guarantee.get_pallet_results(algo=Algorithm.BNB, orderID=order_id, order_dict=order_dict, print_mode=print_pallets, save_mode=save_pallets, bnb_stats=stats_no_guarantee)
 
         print(f"\n----------------------------------------------------------------------------------------------------------------------------")
-        print(f"\nRunning order {order_id} with guarantee on...")
+        print(f"Running order {order_id} with guarantee on...")
 
         # Run order with optimality guarantee and save image
         pallet_with_guarantee = Pallet()
@@ -1117,7 +1116,7 @@ def run_optimality_guarantee_test(start_order=1, end_order=None, order_dict=test
             leave_tqdm=False, optimality_guarantee=True
         )
         score_with_guarantee = pallet_with_guarantee.get_max_height() if metric == Metric.MAX_Z else None
-        pallet_no_guarantee.get_pallet_results(algo=Algorithm.BNB, orderID=order_id, order_dict=order_dict, print_mode=False, save_mode=True, bnb_stats=stats_with_guarantee)
+        pallet_no_guarantee.get_pallet_results(algo=Algorithm.BNB, orderID=order_id, order_dict=order_dict, print_mode=print_pallets, save_mode=save_pallets, bnb_stats=stats_with_guarantee)
 
         # Calculate differences, absolute and relative
         def calculate_row_difference(val_no_guarantee, val_with_guarantee):
@@ -1163,7 +1162,7 @@ def run_optimality_guarantee_test(start_order=1, end_order=None, order_dict=test
             'dedupe_diff_factor':    dd_factor,
         })
 
-        print(f"\n----------------------------------------------------------------------------------------------------------------------------")
+        print(f"----------------------------------------------------------------------------------------------------------------------------")
         print(f"Score  : {score_no_guarantee} (no guarantee) vs {score_with_guarantee} (with guarantee)")
         print(f"Nodes  : {stats_no_guarantee['nodes']:,} vs {stats_with_guarantee['nodes']:,}  (Difference: {nodes_diff:+,}, Factor: {nodes_factor})")
 
@@ -1192,6 +1191,9 @@ current_metric = Metric.MAX_Z
 #     testpallet = process_order(current_orderID, algo=current_algo, criterion=current_criterion, order_dict=current_order_dict, metric=current_metric)
 #     testpallet.get_pallet_results(current_algo, current_orderID, current_order_dict, print_mode=True)
 
-run_optimality_guarantee_test(start_order=1400, end_order=1599, order_dict=test_orders_dict)
+if NOTEBOOK_MODE == True:
+    run_optimality_guarantee_test(start_order=1400, end_order=1408, order_dict=test_orders_dict, print_pallets=True, save_pallets=False)
+else:
+    run_optimality_guarantee_test(start_order=1400, end_order=1599, order_dict=test_orders_dict, print_pallets=False, save_pallets=True)
 
 
