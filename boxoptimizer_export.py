@@ -482,13 +482,13 @@ class Pallet:
 
             # Format metrics into neat block of text
             metrics_lines = [
-                "  ── Run Information ──────────────────",
+                "  -- Run Information ------------------",
                 f"  Algorithm:              {algo.value.upper()}",
                 f"  Order ID:               {orderID}",
                 f"  Dataset:                {set_name_display}",
                 f"  BnB Opt. Guarantee:     {optimal_tag}",
                 "",
-                "  ── Packing Metrics ──────────────────",
+                "  -- Packing Metrics ------------------",
                 f"  Order Fulfillment:      {fulfillment} %",
                 f"  Volume Utilization:     {volume_util} %",
                 f"  Area Filled at z=0:     {area_usage_at_z0} %",
@@ -502,7 +502,7 @@ class Pallet:
                 total_pruned = (bnb_stats['pruned_rule1'] + bnb_stats['pruned_rule2'] + bnb_stats['pruned_rule4'] + bnb_stats['pruned_dedupe'])
                 metrics_lines += [
                     "",
-                    "  ── BnB Search Stats ─────────────────",
+                    " --- BnB Search Stats -----------------",
                     f"  Nodes evaluated:        {bnb_stats['nodes']:,}",
                     f"  Nodes pruned by rule:\n"
                     f"  Rule 1 (trivial):       {bnb_stats['pruned_rule1']:,}",
@@ -1095,7 +1095,7 @@ def run_optimality_guarantee_test(start_order=1, end_order=None, order_dict=test
         print(f"----------------------------------------------------------------------------------------------------------------------------")
         print(f"\nRunning order {order_id} with guarantee off...")
 
-        # Run order with no optimality guarantee
+        # Run order with no optimality guarantee and save image
         pallet_no_guarantee = Pallet()
         box_list = get_box_list_from_order(order_id, order_dict)
         stats_no_guarantee = place_box_list_branch_and_bound(
@@ -1104,11 +1104,12 @@ def run_optimality_guarantee_test(start_order=1, end_order=None, order_dict=test
             leave_tqdm=False, optimality_guarantee=False
         )
         score_no_guarantee = pallet_no_guarantee.get_max_height() if metric == Metric.MAX_Z else None
+        pallet_no_guarantee.get_pallet_results(algo=Algorithm.BNB, order_dict=order_dict, print_mode=False, save_mode=True, bnb_stats=stats_no_guarantee)
 
         print(f"\n----------------------------------------------------------------------------------------------------------------------------")
         print(f"\nRunning order {order_id} with guarantee on...")
 
-        # Run order with optimality guarantee
+        # Run order with optimality guarantee and save image
         pallet_with_guarantee = Pallet()
         stats_with_guarantee= place_box_list_branch_and_bound(
             pallet_with_guarantee, box_list,
@@ -1116,6 +1117,7 @@ def run_optimality_guarantee_test(start_order=1, end_order=None, order_dict=test
             leave_tqdm=False, optimality_guarantee=True
         )
         score_with_guarantee = pallet_with_guarantee.get_max_height() if metric == Metric.MAX_Z else None
+        pallet_no_guarantee.get_pallet_results(algo=Algorithm.BNB, order_dict=order_dict, print_mode=False, save_mode=True, bnb_stats=stats_with_guarantee)
 
         # Calculate differences, absolute and relative
         def calculate_row_difference(val_no_guarantee, val_with_guarantee):
@@ -1127,7 +1129,6 @@ def run_optimality_guarantee_test(start_order=1, end_order=None, order_dict=test
         r1_diff,       r1_factor       = calculate_row_difference(stats_no_guarantee['pruned_rule1'],  stats_with_guarantee['pruned_rule1'])
         r2_diff,       r2_factor       = calculate_row_difference(stats_no_guarantee['pruned_rule2'],  stats_with_guarantee['pruned_rule2'])
         r4_diff,       r4_factor       = calculate_row_difference(stats_no_guarantee['pruned_rule4'],  stats_with_guarantee['pruned_rule4'])
-        # Dedupe is always 0 when guarantee is active; calculate difference as no_guarantee - 0 for clarity
         dd_diff,       dd_factor       = calculate_row_difference(stats_no_guarantee['pruned_dedupe'], stats_with_guarantee['pruned_dedupe'])
 
         result_rows.append({
@@ -1155,7 +1156,7 @@ def run_optimality_guarantee_test(start_order=1, end_order=None, order_dict=test
             'r4_with_guarantee':     stats_with_guarantee['pruned_rule4'],
             'r4_diff_abs':           r4_diff,
             'r4_diff_factor':        r4_factor,
-            # Pruned by deduplication (always 0 with guarantee active)
+            # Pruned by deduplication
             'dedupe_no_guarantee':   stats_no_guarantee['pruned_dedupe'],
             'dedupe_with_guarantee': stats_with_guarantee['pruned_dedupe'],
             'dedupe_diff_abs':       dd_diff,
