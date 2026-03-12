@@ -875,7 +875,7 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
     if opt_metric == Metric.MAX_Z:
         temp_pallet = Pallet()
         place_box_list_best_fit_decreasing(temp_pallet, sorted_box_list, criterion=criterion)
-        best_score = temp_pallet.get_max_height()
+        best_score = temp_pallet.get_max_height() + 1 # Make sure BnB algorithm doesn't fail catastrophically if unable to find a better solution than BFD
     elif opt_metric in maximize_metrics:
         best_score = -1                     # Worse than any possible score as minimum for both maximization metrics is 0
     elif opt_metric in minimize_metrics:
@@ -910,7 +910,7 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
             # Update best score and sequence if this is the best found so far
             is_better = (opt_metric in maximize_metrics and current_score > best_score) or (opt_metric in minimize_metrics and current_score < best_score)
             if is_better:
-                print(f"New best score: {current_score}")
+                #print(f"New best score: {current_score}")
                 best_score = current_score
                 best_sequence = list(current_sequence)
             return
@@ -1093,7 +1093,7 @@ def run_optimality_guarantee_test(start_order=1, end_order=None, order_dict=test
     for order_id in tqdm(order_ids, desc="Testing orders", unit=" orders"):
         print(f"\n----------------------------------------------------------------------------------------------------------------------------")
         print(f"----------------------------------------------------------------------------------------------------------------------------")
-        print(f"Running order {order_id} with guarantee off...")
+        print(f"\nRunning order {order_id} with guarantee off...")
 
         # Run order with no optimality guarantee
         pallet_no_guarantee = Pallet()
@@ -1105,7 +1105,8 @@ def run_optimality_guarantee_test(start_order=1, end_order=None, order_dict=test
         )
         score_no_guarantee = pallet_no_guarantee.get_max_height() if metric == Metric.MAX_Z else None
 
-        print(f"Running order {order_id} with guarantee on...")
+        print(f"\n----------------------------------------------------------------------------------------------------------------------------")
+        print(f"\nRunning order {order_id} with guarantee on...")
 
         # Run order with optimality guarantee
         pallet_with_guarantee = Pallet()
@@ -1161,6 +1162,7 @@ def run_optimality_guarantee_test(start_order=1, end_order=None, order_dict=test
             'dedupe_diff_factor':    dd_factor,
         })
 
+        print(f"\n----------------------------------------------------------------------------------------------------------------------------")
         print(f"Score  : {score_no_guarantee} (no guarantee) vs {score_with_guarantee} (with guarantee)")
         print(f"Nodes  : {stats_no_guarantee['nodes']:,} vs {stats_with_guarantee['nodes']:,}  (Difference: {nodes_diff:+,}, Factor: {nodes_factor})")
 
@@ -1189,6 +1191,6 @@ current_metric = Metric.MAX_Z
 #     testpallet = process_order(current_orderID, algo=current_algo, criterion=current_criterion, order_dict=current_order_dict, metric=current_metric)
 #     testpallet.get_pallet_results(current_algo, current_orderID, current_order_dict, print_mode=True)
 
-run_optimality_guarantee_test(start_order=1401, end_order=1550, order_dict=test_orders_dict)
+run_optimality_guarantee_test(start_order=1400, end_order=1599, order_dict=test_orders_dict)
 
 
