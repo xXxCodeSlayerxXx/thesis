@@ -1209,7 +1209,7 @@ def run_optimality_guarantee_test(start_order=1, end_order=None, order_dict=test
 
 # %%
 current_order_dict = test_orders_dict
-current_orderID = 15
+current_orderID = 18
 current_algo = Algorithm.BNB
 current_criterion = Criterion.VOLUME
 current_metric = Metric.MAX_Z
@@ -1222,6 +1222,7 @@ if NOTEBOOK_MODE == True:
         testpallet = process_order(current_orderID, algo=current_algo, criterion=current_criterion, order_dict=current_order_dict, metric=current_metric)
         testpallet.get_pallet_results(current_algo, current_orderID, current_order_dict, print_mode=True)
 else:
-    run_optimality_guarantee_test(start_order=1400, end_order=1599, order_dict=test_orders_dict, print_pallets=False, save_pallets=True)
+    run_optimality_guarantee_test(start_order=1000, end_order=1999, order_dict=test_orders_dict, print_pallets=False, save_pallets=True)
+
 
 
