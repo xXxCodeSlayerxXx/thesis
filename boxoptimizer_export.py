@@ -1102,8 +1102,7 @@ def plot_random_performance(trials, max_max_attempts, step):                    
 
     plt.show()
 
-def run_optimality_guarantee_test(start_order=1, end_order=None, order_dict=test_orders_dict, criterion=DEFAULT_CRITERION, metric=Metric.MAX_Z, output_csv="bnb_guarantee_comparison.csv", print_pallets=False, save_pallets=False):    # Run BnB with and without the optimality guarantee on a range of orders and export a comparison CSV
-
+def run_optimality_guarantee_test(start_order=1, end_order=None, order_dict=test_orders_dict, criterion=DEFAULT_CRITERION, metric=Metric.MAX_Z, print_pallets=False, save_pallets=False):    # Run BnB with and without the optimality guarantee on a range of orders and export a comparison CSV
     # If no final order is specified, let the final order be the last entry in the dict
     if end_order is None:
         end_order = max(order_dict.keys())
@@ -1197,6 +1196,7 @@ def run_optimality_guarantee_test(start_order=1, end_order=None, order_dict=test
         print(f"Nodes  : {stats_no_guarantee['nodes']:,} vs {stats_with_guarantee['nodes']:,}  (Difference: {nodes_diff:+,}, Factor: {nodes_factor})")
 
     # Export to CSV
+    output_csv=f"./results/bnb_guarantee_comparison_{start_order}_to_{end_order}.csv"
     results_df = pd.DataFrame(result_rows)
     results_df.to_csv(output_csv, index=False)
     print(f"\n----------------------------------------------------------------------------------------------------------------------------")
@@ -1209,7 +1209,7 @@ def run_optimality_guarantee_test(start_order=1, end_order=None, order_dict=test
 
 # %%
 current_order_dict = test_orders_dict
-current_orderID = 18
+current_orderID = 16
 current_algo = Algorithm.BNB
 current_criterion = Criterion.VOLUME
 current_metric = Metric.MAX_Z
@@ -1222,7 +1222,7 @@ if NOTEBOOK_MODE == True:
         testpallet = process_order(current_orderID, algo=current_algo, criterion=current_criterion, order_dict=current_order_dict, metric=current_metric)
         testpallet.get_pallet_results(current_algo, current_orderID, current_order_dict, print_mode=True)
 else:
-    run_optimality_guarantee_test(start_order=1000, end_order=1999, order_dict=test_orders_dict, print_pallets=False, save_pallets=True)
+    run_optimality_guarantee_test(start_order=1000, end_order=1099, order_dict=test_orders_dict, print_pallets=False, save_pallets=False)
 
 
 
