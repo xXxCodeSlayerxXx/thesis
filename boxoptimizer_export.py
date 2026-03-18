@@ -1196,7 +1196,7 @@ def run_optimality_guarantee_test(start_order=1, end_order=None, order_dict=test
         print(f"Nodes  : {stats_no_guarantee['nodes']:,} vs {stats_with_guarantee['nodes']:,}  (Difference: {nodes_diff:+,}, Factor: {nodes_factor})")
 
     # Export to CSV
-    output_csv=f"./results/bnb_guarantee_comparison_{start_order}_to_{end_order}.csv"
+    output_csv=f"./results/bnb_comparisons/bnb_guarantee_comparison_{start_order}_to_{end_order}.csv"
     results_df = pd.DataFrame(result_rows)
     results_df.to_csv(output_csv, index=False)
     print(f"\n----------------------------------------------------------------------------------------------------------------------------")
@@ -1209,7 +1209,7 @@ def run_optimality_guarantee_test(start_order=1, end_order=None, order_dict=test
 
 # %%
 current_order_dict = test_orders_dict
-current_orderID = 16
+current_orderID = 1024
 current_algo = Algorithm.BNB
 current_criterion = Criterion.VOLUME
 current_metric = Metric.MAX_Z
