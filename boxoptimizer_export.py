@@ -106,6 +106,8 @@ class Pallet:
         self.extpts = {(0, 0)}
         # Initialize total occupied volume under heightmap counter (boxes + wasted volume)
         self.heightmap_sum = 0
+        # Initialize storage of max Z
+        self.max_z = 0
 
     def reset(self):                                                            # Emtpy the pallet
         # Clear the list of boxes
@@ -119,6 +121,8 @@ class Pallet:
         self.extpts = {(0, 0)}
         # Reset occupied volume counter
         self.heightmap_sum = 0
+        # Reset storage of max Z
+        self.max_z = 0
 
     # Box placement logic
     def get_in_bounds_status(self, x, y, z):                                    # Check if the given (x, y, z) position is within the pallet boundaries
@@ -175,9 +179,10 @@ class Pallet:
         new_local_sum = dx * dy * (z + dz)
         heightmap_sum_delta = new_local_sum - old_local_sum
         
-        # Place the box: update the heightmap and store the dimensions in the boxlist
+        # Place the box: update the heightmap and max z (if it is increased) and store the dimensions in the boxlist
         self.heightmap[x:x+dx, y:y+dy] = z + dz
         self.heightmap_sum += heightmap_sum_delta
+        self.max_z = max(self.max_z, z + dz)
         self.boxes.append({
             'x': x, 'y': y, 'z': z, 'dx': dx, 'dy': dy, 'dz': dz
         })
@@ -193,9 +198,11 @@ class Pallet:
         # Put together all the information needed to reverse this move in a delta dict
         delta = {
             'x': x, 
-            'y': y, 
+            'y': y,
+            'z': z,
             'dx': dx, 
             'dy': dy,
+            'dz': dz,
             'heightmap_backup': heightmap_backup,
             'heightmap_sum_delta': heightmap_sum_delta,
             'x_candidate_added': adding_candidate_x,
@@ -214,6 +221,10 @@ class Pallet:
 
         # Revert change to heightmap sum
         self.heightmap_sum -= delta['heightmap_sum_delta']
+
+        # Recompute max_z if removed box was the tallest one
+        if delta['z'] + delta['dz'] >= self.max_z:
+            self.max_z = np.max(self.heightmap)
         
         # Remove the last box off the list
         self.boxes.pop()
@@ -300,7 +311,7 @@ class Pallet:
 
     # Pallet metrics and visualization methods
     def get_max_height(self):                                                   # Max height of boxes on the pallet, value to optimize for
-        return np.max(self.heightmap)
+        return self.max_z
 
     def get_min_height(self):                                                   # Min height of boxes on the pallet (usually 0 as it is unlikely boxes will cover every mm^2)
         return np.min(self.heightmap)
@@ -503,14 +514,13 @@ class Pallet:
 
             # Add BnB pruning statistics if BnB is used
             if algo == Algorithm.BNB and bnb_stats is not None:
-                total_pruned = (bnb_stats['pruned_rule1'] + bnb_stats['pruned_rule2'] + bnb_stats['pruned_rule4'] + bnb_stats['pruned_dedupe'] + bnb_stats['pruned_symbreak'])
+                total_pruned = (bnb_stats['pruned_rule1'] + bnb_stats['pruned_rule4'] + bnb_stats['pruned_dedupe'] + bnb_stats['pruned_symbreak'])
                 metrics_lines += [
                     "",
                     " --- BnB Search Stats -----------------",
                     f"  Nodes evaluated:        {bnb_stats['nodes']:,}",
                     f"  Nodes pruned by rule:\n"
                     f"  Rule 1 (trivial):       {bnb_stats['pruned_rule1']:,}",
-                    f"  Rule 2 (volume):        {bnb_stats['pruned_rule2']:,}",
                     f"  Rule 4 (tall-low):      {bnb_stats['pruned_rule4']:,}",
                     f"  Deduplication:          {bnb_stats['pruned_dedupe']:,}",
                     f"  Symmetry breaking       {bnb_stats['pruned_symbreak']:,}",
@@ -871,7 +881,6 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
     # Initialize non-tqdm counters for nodes and pruning for metrics extraction
     count_nodes    = 0
     count_bound1   = 0
-    count_bound2   = 0
     count_bound4   = 0
     count_dedupe   = 0
     count_symbreak = 0
@@ -892,20 +901,35 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
     # Initialize storage for the best sequence of placements found
     best_sequence = None
 
-    # Precalculate volume and footprint to go at each box index for bounding case 2
-    _, volume_to_go_dict = calculate_cumulative_volume_dicts(sorted_box_list)
-    footprint_to_go_dict = calculate_footprint_to_go_dict(sorted_box_list)
-    pallet_area = pallet.size_x * pallet.size_y
+    # Precalculate volume and footprint to go at each box index for bounding case 2 [DEPRECATED]
+    #_, volume_to_go_dict = calculate_cumulative_volume_dicts(sorted_box_list)
+    #footprint_to_go_dict = calculate_footprint_to_go_dict(sorted_box_list)
+    #pallet_area = pallet.size_x * pallet.size_y
 
     # Make list of box dimensions tuples for symmetry breaking rule
     dimension_tuples = []
     for boxid in sorted_box_list:
         dimension_tuples.append(tuple(sorted(get_box_properties_from_id(boxid)[:3])))
 
+    # Precalculate box orientations for this order
+    box_orientations_dict = {}
+    for boxid in set(sorted_box_list):
+        dx, dy, dz, _, _ = get_box_properties_from_id(boxid)
+        box_orientations_dict[boxid] = get_box_orientations(dx, dy, dz)
+
+    # Precalculate tallest remaining box orientations for bounding rule 4
+    tallest_remaining_orientations = []
+    for i in range(len(sorted_box_list)):
+        tallest_remaining_id = max(
+            sorted_box_list[i:],
+            key=lambda bid: min(get_box_properties_from_id(bid)[:3])
+        )
+        tallest_remaining_orientations.append(box_orientations_dict[tallest_remaining_id])
+
     def recursive_place(box_index):         # Define recursive function to place boxes one by one and prune as needed
         # Take the best_score and best_sequence variables, along with the node and pruning counters into
         # local scope of the recursive function so they can be updated without having to make them global
-        nonlocal best_score, best_sequence, count_nodes, count_bound1, count_bound2, count_bound4, count_dedupe, count_symbreak
+        nonlocal best_score, best_sequence, count_nodes, count_bound1, count_bound4, count_dedupe, count_symbreak
 
         # BASE CASE: if we've placed all boxes, evaluate score and update best if needed
         if box_index == len(sorted_box_list):
@@ -935,19 +959,19 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
                 count_bound1 += 1
                 return
 
-            # Bounding rule 2 (volume bound): Check if remaining box volume fits under current max z. If it doesn't, check how much max z would be raised by adding the volume over the remaining box footprints (flat box packing) or the total pallet area, whichever is lowest. If the max z is raised over the current best, prune branch
-            volume_to_go = volume_to_go_dict[box_index]
-            current_max = pallet.get_max_height()
-            free_volume_under_current_max = current_max * pallet_area - pallet.heightmap_sum
-            if volume_to_go > free_volume_under_current_max:
-                overflow = volume_to_go - free_volume_under_current_max
-                footprint_to_go = footprint_to_go_dict[box_index]
-                effective_footprint = min(footprint_to_go, pallet_area)
-                lower_bound = current_max + overflow / effective_footprint
-                if lower_bound >= best_score:
-                    counter_bound2.update(1)
-                    count_bound2 += 1
-                    return
+            # Bounding rule 2 (volume bound) [DEPRECATED]: Check if remaining box volume fits under current max z. If it doesn't, check how much max z would be raised by adding the volume over the remaining box footprints (flat box packing) or the total pallet area, whichever is lowest. If the max z is raised over the current best, prune branch
+            # volume_to_go = volume_to_go_dict[box_index]
+            # current_max = pallet.get_max_height()
+            # free_volume_under_current_max = current_max * pallet_area - pallet.heightmap_sum
+            # if volume_to_go > free_volume_under_current_max:
+            #     overflow = volume_to_go - free_volume_under_current_max
+            #     footprint_to_go = footprint_to_go_dict[box_index]
+            #     effective_footprint = min(footprint_to_go, pallet_area)
+            #     lower_bound = current_max + overflow / effective_footprint
+            #     if lower_bound >= best_score:
+            #         counter_bound2.update(1)
+            #         count_bound2 += 1
+            #         return
 
             # Bounding rule 3 (look-ahead bound) [DEPRECATED]: Check one box ahead to see if the best-case placement does not push the height over best_score
             # next_boxid = sorted_box_list[box_index]
@@ -958,13 +982,7 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
             #     return
             
             # Bounding rule 4 (tallest-lowest): Check if tallest remaining box placed at its lowest possible candidate position exceeds best_score
-            # Find the box with largest minimum dimension
-            tallest_remaining = max(
-                sorted_box_list[box_index:],
-                key=lambda bid: min(get_box_properties_from_id(bid)[:3])
-            )
-            t_dx, t_dy, t_dz, _, _ = get_box_properties_from_id(tallest_remaining)
-            t_orientations = get_box_orientations(t_dx, t_dy, t_dz)
+            t_orientations = tallest_remaining_orientations[box_index]
 
             min_landing_z = PALLET_DIMS[2] + 100
             for x, y in pallet.extpts:
@@ -980,8 +998,7 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
 
         # BRANCHING CASE: try to place the next box in all possible orientations and positions, and recursively place the next box after each valid placement
         boxid = sorted_box_list[box_index]
-        original_dx, original_dy, original_dz, _, _ = get_box_properties_from_id(boxid)
-        orientations = get_box_orientations(original_dx, original_dy, original_dz)
+        orientations = box_orientations_dict[boxid]
 
         # Initialize set (every member must be unique) of seen profiles for deduplication rule
         seen_profiles = set() if not use_guarantee else None
@@ -992,8 +1009,10 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
         else:
             symbreak_key = None
 
+        # Sort extreme points and 
+        sorted_extpts = sorted(pallet.extpts)
         for dims in orientations:
-            for x, y in sorted(pallet.extpts):
+            for x, y in sorted_extpts:
                 if pallet.check_box_placement_validity(dims, x, y):
 
                     # Deduplication rule: if optimality need not be guaranteed, check if placing the box in the same orientation at another extreme point leads to the same resultant z-height. This is likely to lead to a very similar heightmap structure, so prune all these candidate branches except for one representative. 
@@ -1024,7 +1043,7 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
     # Start the recursive search starting with the first box (index 0) and keep track of branches and bounds
     pbar             = tqdm(desc="Evaluating Placements", unit=" nodes", leave=leave_tqdm, total=1766249) # Total is set to previous best to estimate time
     counter_bound1   = tqdm(desc="Number of branches pruned by bounding rule 1", unit=" prunes", leave=leave_tqdm)
-    counter_bound2   = tqdm(desc="Number of branches pruned by bounding rule 2", unit=" prunes", leave=leave_tqdm)
+    #counter_bound2  = tqdm(desc="Number of branches pruned by bounding rule 2", unit=" prunes", leave=leave_tqdm)
     #counter_bound3  = tqdm(desc="Number of branches pruned by bounding rule 3", unit=" prunes", leave=leave_tqdm)
     counter_bound4   = tqdm(desc="Number of branches pruned by bounding rule 4", unit=" prunes", leave=leave_tqdm)
     counter_dedupe   = tqdm(desc="Number of branches pruned by deduplication rule", unit=" prunes", leave=leave_tqdm)
@@ -1042,7 +1061,6 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
     bnb_stats = {
         'nodes':                count_nodes,
         'pruned_rule1':         count_bound1,
-        'pruned_rule2':         count_bound2,
         'pruned_rule4':         count_bound4,
         'pruned_dedupe':        count_dedupe,
         'pruned_symbreak':      count_symbreak,
@@ -1153,7 +1171,6 @@ def run_optimality_guarantee_test(start_order=1, end_order=None, order_dict=test
 
         nodes_diff,    nodes_factor    = calculate_row_difference(stats_no_guarantee['nodes'],           stats_with_guarantee['nodes'])
         r1_diff,       r1_factor       = calculate_row_difference(stats_no_guarantee['pruned_rule1'],    stats_with_guarantee['pruned_rule1'])
-        r2_diff,       r2_factor       = calculate_row_difference(stats_no_guarantee['pruned_rule2'],    stats_with_guarantee['pruned_rule2'])
         r4_diff,       r4_factor       = calculate_row_difference(stats_no_guarantee['pruned_rule4'],    stats_with_guarantee['pruned_rule4'])
         dd_diff,       dd_factor       = calculate_row_difference(stats_no_guarantee['pruned_dedupe'],   stats_with_guarantee['pruned_dedupe'])
         sb_diff,       sb_factor       = calculate_row_difference(stats_no_guarantee['pruned_symbreak'], stats_with_guarantee['pruned_symbreak'])
@@ -1173,11 +1190,6 @@ def run_optimality_guarantee_test(start_order=1, end_order=None, order_dict=test
             'r1_with_guarantee':        stats_with_guarantee['pruned_rule1'],
             'r1_diff_abs':              r1_diff,
             'r1_diff_factor':           r1_factor,
-            # Pruned by rule 2
-            'r2_no_guarantee':          stats_no_guarantee['pruned_rule2'],
-            'r2_with_guarantee':        stats_with_guarantee['pruned_rule2'],
-            'r2_diff_abs':              r2_diff,
-            'r2_diff_factor':           r2_factor,
             # Pruned by rule 4
             'r4_no_guarantee':          stats_no_guarantee['pruned_rule4'],
             'r4_with_guarantee':        stats_with_guarantee['pruned_rule4'],
@@ -1226,7 +1238,7 @@ if NOTEBOOK_MODE == True:
         testpallet = process_order(current_orderID, algo=current_algo, criterion=current_criterion, order_dict=current_order_dict, metric=current_metric)
         testpallet.get_pallet_results(current_algo, current_orderID, current_order_dict, print_mode=True)
 else:
-    run_optimality_guarantee_test(start_order=1500, end_order=1500, order_dict=test_orders_dict, print_pallets=False, save_pallets=False)
+    run_optimality_guarantee_test(start_order=1000, end_order=1000, order_dict=test_orders_dict, print_pallets=False, save_pallets=False)
 
 
 
