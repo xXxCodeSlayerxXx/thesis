@@ -18,3 +18,4 @@
 "Symmetry breaking rule addition",00,03,4329,1246,260,3569,0,0,182,8373,2987,"Another breakthrough! Turns out that testing a bunch of randomly generated boxes leads you to the understanding that having a bunch of the same box dimension leads to combinatorial explosions and deduplication / symmetry breakage must occur for computation timeframes to be reasonable, optimality guarantee or not."
 
 "Benchmark difficulty increase",24,48,1766249,948,333,1591909,0,0,33057,3047645,1942589,"No code changes, but performance benchmarks from here on out will be done on test order 25 (25 boxes) from this point on due to achieving trivialization of test order 15."
+"Rule 2 deprecation + optimizations",,,,,,,,,,,,,
