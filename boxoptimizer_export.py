@@ -186,7 +186,8 @@ class Pallet:
         if adding_candidate_x: self.candidates_x.add(x + dx)
         if adding_candidate_y: self.candidates_y.add(y + dy)
 
-        # Recalculate extreme points after the move
+        # Save old set of extreme points calculate the post-move set
+        old_extpts = self.extpts.copy()
         self.calculate_extreme_points()
 
         # Put together all the information needed to reverse this move in a delta dict
@@ -198,7 +199,9 @@ class Pallet:
             'heightmap_backup': heightmap_backup,
             'heightmap_sum_delta': heightmap_sum_delta,
             'x_candidate_added': adding_candidate_x,
-            'y_candidate_added': adding_candidate_y
+            'y_candidate_added': adding_candidate_y,
+            'added_extpts': self.extpts.difference(old_extpts),
+            'removed_extpts': old_extpts.difference(self.extpts)
         }
 
         # Return delta to indicate successful placement
@@ -219,8 +222,9 @@ class Pallet:
         if delta['x_candidate_added']: self.candidates_x.remove(x + dx)
         if delta['y_candidate_added']: self.candidates_y.remove(y + dy)
 
-        # Recalculate extreme points after deletion
-        self.calculate_extreme_points()
+        # Revert extreme points set with information from delta: remove added points, and restore removed points
+        self.extpts = self.extpts.difference(delta['added_extpts'])
+        self.extpts = self.extpts.union(delta['removed_extpts'])
 
     # Pallet state and analysis methods    
     def get_max_height_in_area(self, x, y, dx, dy):                             # Get the maximum height in a rectangular area of the heightmap
@@ -1018,7 +1022,7 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
                         pallet.remove_box(delta)
     
     # Start the recursive search starting with the first box (index 0) and keep track of branches and bounds
-    pbar             = tqdm(desc="Evaluating Placements", unit=" nodes", leave=leave_tqdm, total=2122024) # Total is set to previous best to estimate time
+    pbar             = tqdm(desc="Evaluating Placements", unit=" nodes", leave=leave_tqdm, total=1766249) # Total is set to previous best to estimate time
     counter_bound1   = tqdm(desc="Number of branches pruned by bounding rule 1", unit=" prunes", leave=leave_tqdm)
     counter_bound2   = tqdm(desc="Number of branches pruned by bounding rule 2", unit=" prunes", leave=leave_tqdm)
     #counter_bound3  = tqdm(desc="Number of branches pruned by bounding rule 3", unit=" prunes", leave=leave_tqdm)
@@ -1209,7 +1213,7 @@ def run_optimality_guarantee_test(start_order=1, end_order=None, order_dict=test
 
 # %%
 current_order_dict = test_orders_dict
-current_orderID = 1024
+current_orderID = 25
 current_algo = Algorithm.BNB
 current_criterion = Criterion.VOLUME
 current_metric = Metric.MAX_Z
