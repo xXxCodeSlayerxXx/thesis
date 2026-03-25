@@ -19,4 +19,5 @@
 
 "Benchmark difficulty increase",24,48,1766249,948,333,1591909,0,0,33057,3047645,1942589,,"No code changes, but performance benchmarks from here on out will be done on test order 25 (25 boxes) from this point on due to achieving trivialization of test order 15."
 "Rule 2 deprecation + optimizations",23,31,1766249,971,333,1591909,0,0,33057,3047645,1942589,,"Very small optimization. Should consider more."
-"Heightmap recognition rule addition",,,,,,,,,,,,,
+"Heightmap recognition rule addition",61,55,1756995,424,333,1584383,0,0,32009,3028995,1930085,1287,"Shame that such a smart bound on paper results in neglegible gains. This rule can go immediately."
+"Optimization and ordering fix",,,,,,,,,,,,,
