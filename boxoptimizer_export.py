@@ -524,7 +524,6 @@ class Pallet:
                     f"  Rule 4 (tall-low):      {bnb_stats['pruned_rule4']:,}",
                     f"  Deduplication:          {bnb_stats['pruned_dedupe']:,}",
                     f"  Symmetry breaking       {bnb_stats['pruned_symbreak']:,}",
-                    f"  Heightmap recognition   {bnb_stats['pruned_hm_rec']:,}",
                     "",
                     f"  Total pruned:           {total_pruned:,}",
                 ]
@@ -909,7 +908,7 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
     #pallet_area = pallet.size_x * pallet.size_y
 
     # Keep global dict of seen heightmap hashes keyed by tree depth for heightmap recognition pruning
-    seen_heightmaps_by_depth_dict = {}
+    # seen_heightmaps_by_depth_dict = {}
 
     # Make list of box dimensions tuples for symmetry breaking rule
     dimension_tuples = []
@@ -1041,16 +1040,16 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
                     if not delta:
                         continue
 
-                    # Heightmap recognition rule: if current heightmap has already been seen at this search depth (no matter on which branch), prune branch as it will lead to copied search space down-tree
-                    heightmap_hash = hash(pallet.heightmap.tobytes())
-                    hashes_at_current_depth = seen_heightmaps_by_depth_dict.setdefault(box_index, set())
-                    if heightmap_hash in hashes_at_current_depth:
-                        pallet.remove_box(delta)
-                        count_hm_rec += 1
-                        counter_hm_rec.update(1)
-                        continue
-                    # If hash has not been seen at this depth, add it to the set of seen hashes at this depth
-                    hashes_at_current_depth.add(heightmap_hash)
+                    # Heightmap recognition rule [DEPRECATED]: if current heightmap has already been seen at this search depth (no matter on which branch), prune branch as it will lead to copied search space down-tree
+                    # heightmap_hash = hash(pallet.heightmap.tobytes())
+                    # hashes_at_current_depth = seen_heightmaps_by_depth_dict.setdefault(box_index, set())
+                    # if heightmap_hash in hashes_at_current_depth:
+                    #     pallet.remove_box(delta)
+                    #     count_hm_rec += 1
+                    #     counter_hm_rec.update(1)
+                    #     continue
+                    # # If hash has not been seen at this depth, add it to the set of seen hashes at this depth
+                    # hashes_at_current_depth.add(heightmap_hash)
 
                     # If branch has not been pruned, add placement to sequence and recurse
                     current_sequence.append((dims, x, y))
@@ -1068,7 +1067,7 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
     counter_bound4   = tqdm(desc="Number of branches pruned by bounding rule 4", unit=" prunes", leave=leave_tqdm)
     counter_dedupe   = tqdm(desc="Number of branches pruned by deduplication rule", unit=" prunes", leave=leave_tqdm)
     counter_symbreak = tqdm(desc="Number of branches pruned by symmetry breaking rule",unit=" prunes", leave=leave_tqdm)
-    counter_hm_rec   = tqdm(desc="Number of branches pruned by heightmap recognition rule",unit=" prunes", leave=leave_tqdm)
+    #counter_hm_rec   = tqdm(desc="Number of branches pruned by heightmap recognition rule",unit=" prunes", leave=leave_tqdm)
     recursive_place(0)
 
     # Reconstruct the optimal pallet state using the best sequence found
@@ -1085,7 +1084,6 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
         'pruned_rule4':         count_bound4,
         'pruned_dedupe':        count_dedupe,
         'pruned_symbreak':      count_symbreak,
-        'pruned_hm_rec':        count_hm_rec,
         'best_score':           best_score,
         'optimality_guarantee': use_guarantee,
     }
@@ -1196,7 +1194,6 @@ def run_optimality_guarantee_test(start_order=1, end_order=None, order_dict=test
         r4_diff,       r4_factor       = calculate_row_difference(stats_no_guarantee['pruned_rule4'],    stats_with_guarantee['pruned_rule4'])
         dd_diff,       dd_factor       = calculate_row_difference(stats_no_guarantee['pruned_dedupe'],   stats_with_guarantee['pruned_dedupe'])
         sb_diff,       sb_factor       = calculate_row_difference(stats_no_guarantee['pruned_symbreak'], stats_with_guarantee['pruned_symbreak'])
-        hr_diff,       hr_factor       = calculate_row_difference(stats_no_guarantee['pruned_hm_rec'],   stats_with_guarantee['pruned_hm_rec'])
 
         result_rows.append({
             'order_id':                 order_id,
@@ -1228,11 +1225,6 @@ def run_optimality_guarantee_test(start_order=1, end_order=None, order_dict=test
             'symbreak_with_guarantee':  stats_with_guarantee['pruned_symbreak'],
             'symbreak_diff_abs':        sb_diff,
             'symbreak_diff_factor':     sb_factor,
-            # Pruned by heightmap recognition
-            'hm_rec_no_guarantee':      stats_no_guarantee['pruned_hm_rec'],
-            'hm_rec_with_guarantee':    stats_with_guarantee['pruned_hm_rec'],
-            'hm_rec_diff_abs':          hr_diff,
-            'hm_rec_diff_factor':       hr_factor,
         })
 
         print(f"----------------------------------------------------------------------------------------------------------------------------")
