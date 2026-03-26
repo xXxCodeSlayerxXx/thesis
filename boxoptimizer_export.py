@@ -523,7 +523,8 @@ class Pallet:
                     f"  Rule 1 (trivial):       {bnb_stats['pruned_rule1']:,}",
                     f"  Rule 4 (tall-low):      {bnb_stats['pruned_rule4']:,}",
                     f"  Deduplication:          {bnb_stats['pruned_dedupe']:,}",
-                    f"  Symmetry breaking       {bnb_stats['pruned_symbreak']:,}",
+                    f"  Symmetry breaking:      {bnb_stats['pruned_symbreak']:,}",
+                    f"  Two-surface:            {bnb_stats['pruned_two_surface']:,}"    
                     "",
                     f"  Total pruned:           {total_pruned:,}",
                 ]
@@ -879,12 +880,12 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
     minimize_metrics = [Metric.COG_Z, Metric.MAX_Z]
 
     # Initialize non-tqdm counters for nodes and pruning for metrics extraction
-    count_nodes    = 0
-    count_bound1   = 0
-    count_bound4   = 0
-    count_dedupe   = 0
-    count_symbreak = 0
-    count_hm_rec = 0
+    count_nodes         = 0
+    count_bound1        = 0
+    count_bound4        = 0
+    count_dedupe        = 0
+    count_symbreak      = 0
+    count_two_surface   = 0
 
     # Initialize best score tracker for the entire placement
     # For MAX_Z, run the BFD algorithm first to get a decent initial score to beat, making pruning more aggressive.
@@ -907,7 +908,7 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
     #footprint_to_go_dict = calculate_footprint_to_go_dict(sorted_box_list)
     #pallet_area = pallet.size_x * pallet.size_y
 
-    # Keep global dict of seen heightmap hashes keyed by tree depth for heightmap recognition pruning
+    # Keep global dict of seen heightmap hashes keyed by tree depth for heightmap recognition pruning [DEPRECATED]
     # seen_heightmaps_by_depth_dict = {}
 
     # Make list of box dimensions tuples for symmetry breaking rule
@@ -933,7 +934,7 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
     def recursive_place(box_index):         # Define recursive function to place boxes one by one and prune as needed
         # Take the best_score and best_sequence variables, along with the node and pruning counters into
         # local scope of the recursive function so they can be updated without having to make them global
-        nonlocal best_score, best_sequence, count_nodes, count_bound1, count_bound4, count_dedupe, count_symbreak, count_hm_rec
+        nonlocal best_score, best_sequence, count_nodes, count_bound1, count_bound4, count_dedupe, count_symbreak, count_two_surface
 
         # BASE CASE: if we've placed all boxes, evaluate score and update best if needed
         if box_index == len(sorted_box_list):
@@ -1019,22 +1020,30 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
             for x, y in sorted_extpts:
                 # Check whether this placement is valid
                 if pallet.check_box_placement_validity(dims, x, y):
+                    z = pallet.get_max_height_in_area(x, y, dims[0], dims[1])
 
-                    # Symmetry breaking rule: if a comparison key is registered and the candidate placement is smaller than the key (checked value by value in the tuples ((dx, dy, dz), x, y) ), prune branch as it would lead to an identical resultant pallet in terms of dimensions but with different boxes (of the same or different box IDs, like a type 8 or 10 box, which are dimensionally identical) occupying the same place.
-                    if symbreak_key is not None and symbreak_key > (dims, x, y):
-                        counter_symbreak.update(1)
-                        count_symbreak += 1
+                    # Two-surface rule: if the box is not against an edge or a box on both its back and its left, prune branch
+                    left_anchored = (x == 0) or np.any(pallet.heightmap[x-1, y:y+dims[1]] != z)
+                    back_anchored = (y == 0) or np.any(pallet.heightmap[x:x+dims[0], y-1] != z)
+                    if not (left_anchored and back_anchored):
+                        counter_two_surface.update(1)
+                        count_two_surface += 1
                         continue
 
                     # Deduplication rule: if optimality need not be guaranteed, check if placing the box in the same orientation at another extreme point leads to the same resultant z-height. This is likely to lead to a very similar heightmap structure, so prune all these candidate branches except for one representative. 
                     if not use_guarantee:
-                        z = pallet.get_max_height_in_area(x, y, dims[0], dims[1])
                         profile_key = (dims, z)
                         if profile_key in seen_profiles:
                             counter_dedupe.update(1)
                             count_dedupe += 1
                             continue
                         seen_profiles.add(profile_key)
+
+                    # Symmetry breaking rule: if a comparison key is registered and the candidate placement is smaller than the key (checked value by value in the tuples ((dx, dy, dz), x, y) ), prune branch as it would lead to an identical resultant pallet in terms of dimensions but with different boxes (of the same or different box IDs, like a type 8 or 10 box, which are dimensionally identical) occupying the same place.
+                    if symbreak_key is not None and symbreak_key > (dims, x, y):
+                        counter_symbreak.update(1)
+                        count_symbreak += 1
+                        continue
 
                     delta = pallet.place_box(dims, x, y)
                     if not delta:
@@ -1060,14 +1069,15 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
                     pallet.remove_box(delta)
     
     # Start the recursive search starting with the first box (index 0) and keep track of branches and bounds
-    pbar             = tqdm(desc="Evaluating Placements", unit=" nodes", leave=leave_tqdm, total=1766249) # Total is set to previous best to estimate time
-    counter_bound1   = tqdm(desc="Number of branches pruned by bounding rule 1", unit=" prunes", leave=leave_tqdm)
-    #counter_bound2  = tqdm(desc="Number of branches pruned by bounding rule 2", unit=" prunes", leave=leave_tqdm)
-    #counter_bound3  = tqdm(desc="Number of branches pruned by bounding rule 3", unit=" prunes", leave=leave_tqdm)
-    counter_bound4   = tqdm(desc="Number of branches pruned by bounding rule 4", unit=" prunes", leave=leave_tqdm)
-    counter_dedupe   = tqdm(desc="Number of branches pruned by deduplication rule", unit=" prunes", leave=leave_tqdm)
-    counter_symbreak = tqdm(desc="Number of branches pruned by symmetry breaking rule",unit=" prunes", leave=leave_tqdm)
-    #counter_hm_rec   = tqdm(desc="Number of branches pruned by heightmap recognition rule",unit=" prunes", leave=leave_tqdm)
+    pbar                = tqdm(desc="Evaluating Placements", unit=" nodes", leave=leave_tqdm, total=1766249) # Total is set to previous best to estimate time
+    counter_bound1      = tqdm(desc="Number of branches pruned by bounding rule 1", unit=" prunes", leave=leave_tqdm)
+    #counter_bound2     = tqdm(desc="Number of branches pruned by bounding rule 2", unit=" prunes", leave=leave_tqdm)
+    #counter_bound3     = tqdm(desc="Number of branches pruned by bounding rule 3", unit=" prunes", leave=leave_tqdm)
+    counter_bound4      = tqdm(desc="Number of branches pruned by bounding rule 4", unit=" prunes", leave=leave_tqdm)
+    counter_dedupe      = tqdm(desc="Number of branches pruned by deduplication rule", unit=" prunes", leave=leave_tqdm)
+    counter_symbreak    = tqdm(desc="Number of branches pruned by symmetry breaking rule",unit=" prunes", leave=leave_tqdm)
+    #counter_hm_rec     = tqdm(desc="Number of branches pruned by heightmap recognition rule",unit=" prunes", leave=leave_tqdm)
+    counter_two_surface = tqdm(desc="Number of branches pruned by two-surface rule",unit=" prunes", leave=leave_tqdm)
     recursive_place(0)
 
     # Reconstruct the optimal pallet state using the best sequence found
@@ -1084,6 +1094,7 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
         'pruned_rule4':         count_bound4,
         'pruned_dedupe':        count_dedupe,
         'pruned_symbreak':      count_symbreak,
+        'pruned_two_surface':   count_two_surface,
         'best_score':           best_score,
         'optimality_guarantee': use_guarantee,
     }
@@ -1189,11 +1200,12 @@ def run_optimality_guarantee_test(start_order=1, end_order=None, order_dict=test
             factor   = round(val_no_guarantee / val_with_guarantee, 4) if val_with_guarantee != 0 else "N/A" # Avoid division by 0
             return abs_diff, factor
 
-        nodes_diff,    nodes_factor    = calculate_row_difference(stats_no_guarantee['nodes'],           stats_with_guarantee['nodes'])
-        r1_diff,       r1_factor       = calculate_row_difference(stats_no_guarantee['pruned_rule1'],    stats_with_guarantee['pruned_rule1'])
-        r4_diff,       r4_factor       = calculate_row_difference(stats_no_guarantee['pruned_rule4'],    stats_with_guarantee['pruned_rule4'])
-        dd_diff,       dd_factor       = calculate_row_difference(stats_no_guarantee['pruned_dedupe'],   stats_with_guarantee['pruned_dedupe'])
-        sb_diff,       sb_factor       = calculate_row_difference(stats_no_guarantee['pruned_symbreak'], stats_with_guarantee['pruned_symbreak'])
+        nodes_diff, nodes_factor    = calculate_row_difference(stats_no_guarantee['nodes'],                 stats_with_guarantee['nodes'])
+        r1_diff,    r1_factor       = calculate_row_difference(stats_no_guarantee['pruned_rule1'],          stats_with_guarantee['pruned_rule1'])
+        r4_diff,    r4_factor       = calculate_row_difference(stats_no_guarantee['pruned_rule4'],          stats_with_guarantee['pruned_rule4'])
+        dd_diff,    dd_factor       = calculate_row_difference(stats_no_guarantee['pruned_dedupe'],         stats_with_guarantee['pruned_dedupe'])
+        sb_diff,    sb_factor       = calculate_row_difference(stats_no_guarantee['pruned_symbreak'],       stats_with_guarantee['pruned_symbreak'])
+        ts_diff,    ts_factor       = calculate_row_difference(stats_no_guarantee['pruned_two_surface'],    stats_with_guarantee['pruned_two_surface'])
 
         result_rows.append({
             'order_id':                 order_id,
@@ -1225,6 +1237,11 @@ def run_optimality_guarantee_test(start_order=1, end_order=None, order_dict=test
             'symbreak_with_guarantee':  stats_with_guarantee['pruned_symbreak'],
             'symbreak_diff_abs':        sb_diff,
             'symbreak_diff_factor':     sb_factor,
+            # Pruned by the two-surface rule
+            '2_surf_no_guarantee':      stats_no_guarantee['pruned_two_surface'],
+            '2_surf_with_guarantee':    stats_with_guarantee['pruned_two_surface'],
+            '2_surf_diff_abs':          ts_diff,
+            '2_surf_diff_factor':       ts_factor,
         })
 
         print(f"----------------------------------------------------------------------------------------------------------------------------")
