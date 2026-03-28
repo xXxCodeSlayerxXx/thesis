@@ -485,9 +485,10 @@ class Pallet:
             ax3.axis('off')
             ax3.set_title("Metrics Summary", fontsize=13, pad=14)
 
-            # Include BnB optimality guarantee tag when relevant
-            if algo == Algorithm.BNB:
-                optimal_guarantee = bnb_stats.get('optimality_guarantee', None) if bnb_stats else None
+            # Include BnB optimality guarantee tag and candidate limit when relevant
+            if algo == Algorithm.BNB and bnb_stats is not None:
+                optimal_guarantee = bnb_stats.get('optimality_guarantee', None)
+                topx_limit = bnb_stats.get('topx_limit', None)
                 if optimal_guarantee is True:
                     optimal_tag = "ON  (exact)"
                 elif optimal_guarantee is False:
@@ -496,6 +497,7 @@ class Pallet:
                     optimal_tag = f"{'ON' if BNB_OPTIMALITY_GUARANTEE else 'OFF'} (global)"
             else:
                 optimal_tag = "N/A"
+                topx_limit = "N/A"
 
             # Format metrics into neat block of text
             metrics_lines = [
@@ -505,6 +507,7 @@ class Pallet:
                 f"  Boxes in order:         {len(order_dict[orderID])}",
                 f"  Dataset:                {set_name_display}",
                 f"  BnB Opt. Guarantee:     {optimal_tag}",
+                f"  BnB Candidate Limit:    {topx_limit}",
                 "",
                 "  -- Packing Metrics ------------------",
                 f"  Max Z Height:           {max_z}        mm",
@@ -517,19 +520,20 @@ class Pallet:
 
             # Add BnB pruning statistics if BnB is used
             if algo == Algorithm.BNB and bnb_stats is not None:
-                total_pruned = (bnb_stats['pruned_rule1'] + bnb_stats['pruned_rule4'] + bnb_stats['pruned_dedupe'] + bnb_stats['pruned_symbreak'])
+                total_pruned = (bnb_stats['pruned_rule1'] + bnb_stats['pruned_rule4'] + bnb_stats['pruned_filt1'] + bnb_stats['pruned_filt2'] + bnb_stats['pruned_filt5'])
                 metrics_lines += [
                     "",
                     " --- BnB Search Stats -----------------",
-                    f"  Nodes evaluated:        {bnb_stats['nodes']:,}",
+                    f"  Nodes evaluated:          {bnb_stats['nodes']:,}",
                     f"  Branches pruned by rule:\n"
-                    f"  Rule 1 (trivial):       {bnb_stats['pruned_rule1']:,}",
-                    f"  Rule 4 (tall-low):      {bnb_stats['pruned_rule4']:,}",
+                    f"  Rule 1 (trivial):         {bnb_stats['pruned_rule1']:,}",
+                    f"  Rule 4 (tall-low):        {bnb_stats['pruned_rule4']:,}",
                     f"  Branches blocked by filter:\n"
-                    f"  Deduplication:          {bnb_stats['pruned_dedupe']:,}",
-                    f"  Symmetry breaking:      {bnb_stats['pruned_symbreak']:,}",
+                    f"  Deduplication:            {bnb_stats['pruned_filt1']:,}",
+                    f"  Symmetry breaking:        {bnb_stats['pruned_filt2']:,}",
+                    f"  Top-x candidate limiting: {bnb_stats['pruned_filt2']:,}",
                     "",
-                    f"  Total pruned:           {total_pruned:,}",
+                    f"  Total pruned:             {total_pruned:,}",
                 ]
 
             # Join all lines of metrics text into one variable
@@ -668,7 +672,7 @@ def sort_box_list_by_size(box_list, criterion=DEFAULT_CRITERION, invert=False): 
     
     return sorted_list
     
-def process_order(order, algo, max_attempts=DEFAULT_MAX_ATTEMPTS, criterion=DEFAULT_CRITERION, metric=DEFAULT_OPTIMIZATION_METRIC, order_dict=orders_dict, leave_tqdm=True, optimality_guarantee=None):     # Process a given order using the specified algorithm, max attempts, and sorting criterion. For BnB, returns resultant pallet and node+pruning stats, returns resultant pallet only for other algos
+def process_order(order, algo, max_attempts=DEFAULT_MAX_ATTEMPTS, criterion=DEFAULT_CRITERION, metric=DEFAULT_OPTIMIZATION_METRIC, order_dict=orders_dict, leave_tqdm=True, optimality_guarantee=None, num_extpts_to_try=None):     # Process a given order using the specified algorithm, max attempts, and sorting criterion. For BnB, returns resultant pallet and node+pruning stats, returns resultant pallet only for other algos
     box_list = get_box_list_from_order(order, order_dict)
     pallet = Pallet()
 
@@ -685,7 +689,7 @@ def process_order(order, algo, max_attempts=DEFAULT_MAX_ATTEMPTS, criterion=DEFA
         return pallet
 
     elif algo == Algorithm.BNB:
-        bnb_stats = place_box_list_branch_and_bound(pallet, box_list, criterion=criterion, leave_tqdm=leave_tqdm, optimality_guarantee=optimality_guarantee)
+        bnb_stats = place_box_list_branch_and_bound(pallet, box_list, criterion=criterion, leave_tqdm=leave_tqdm, optimality_guarantee=optimality_guarantee, num_extpts_to_try=num_extpts_to_try)
         return pallet, bnb_stats
 
 def get_box_orientations(dx, dy, dz, rot_h=HOR_ROTATION_ALLOWED_DEFAULT, rot_v=VER_ROTATION_ALLOWED_DEFAULT):                           # Get a list of possible orientations for a box with given dimensions, based on allowed rotations
@@ -867,7 +871,7 @@ def place_box_list_best_fit_decreasing(pallet, box_list, criterion=DEFAULT_CRITE
             print(f"Could not place box {boxid} anywhere.")
             pass
 
-def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERION, leave_tqdm=True, optimality_guarantee=None):   # Recursive backtracking algorithm to find the optimal placement of boxes from a box list on the pallet based on optimization metric, with pruning based on bounding functions
+def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERION, leave_tqdm=True, optimality_guarantee=None, num_extpts_to_try=None):   # Recursive backtracking algorithm to find the optimal placement of boxes from a box list on the pallet, with pruning based on bounding functions and branching filters
     # PREWORK AND INITIALIZATIONS
     sorted_box_list = sort_box_list_by_size(box_list, criterion=criterion, invert=False)                    # Sort the box list by size (largest to smallest)
     use_guarantee = BNB_OPTIMALITY_GUARANTEE if optimality_guarantee is None else optimality_guarantee      # Override global optimality guarantee if specified
@@ -898,7 +902,7 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
 
     def recursive_place(box_index):                                                                         # Define recursive function to place boxes one by one and prune as needed
         # Take variables into local scope of the recursive function
-        nonlocal best_score, best_sequence, count_nodes, count_bound1, count_bound4, count_dedupe, count_symbreak
+        nonlocal best_score, best_sequence, count_nodes, count_bound1, count_bound4, count_filt1, count_filt2
 
         # BASE CASE: if all boxes are placed, evaluate score and update best if needed
         if box_index == len(sorted_box_list):
@@ -938,54 +942,68 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
         seen_profiles = set() if not use_guarantee else None                                                # Filter 1 (Deduplication): Initialize set of unique seen profiles
 
         if dimension_tuples[box_index] == dimension_tuples[box_index - 1]:                                  # Filter 2 (Symmetry Breaking): Check if current box matches dimensions of previous box and record (dims, x, y) as comparison key
-            symbreak_key = current_sequence[-1]
+            filt2_key = current_sequence[-1]
         else:
-            symbreak_key = None
+            filt2_key = None
 
-        # Iterate through sorted extreme points and orientations, attempt to place box, and recurse after each valid placement
+        candidate_placements = []                                                                           # Make list of valid placement candidates to loop through
         for dims in orientations:
             for x, y in sorted_extpts:
-                # Check whether this placement is valid
                 if pallet.check_box_placement_validity(dims, x, y):
+                    landing_z = pallet.get_max_height_in_area(x, y, dims[0], dims[1])
+                    top_z     = landing_z + dims[2]
+                    score     = (top_z, x + y)
+                    candidate_placements.append((score, dims, x, y))
 
-                    if not use_guarantee:                                                                   # Filter 1 (Deduplication): if optimality need not be guaranteed, check if placing the box in the same orientation at another extreme point leads to the same resultant z-height. This is likely to lead to a very similar heightmap structure, so prune all these candidate branches except for one representative. 
-                        z = pallet.get_max_height_in_area(x, y, dims[0], dims[1])
-                        profile_key = (dims, z)
-                        if profile_key in seen_profiles:
-                            counter_dedupe.update(1)
-                            count_dedupe += 1
-                            continue
-                        seen_profiles.add(profile_key)
+        if not use_guarantee and num_extpts_to_try is not None:                                             # Filter 5 (Top-X candidates): if optimality need not be guaranteed and candidate limit is specified, score all orientation + placement candidates by resultant box height, then lowest x+y placement, and only branch on the top X scoring candidates
+            candidate_placements.sort(key=lambda c: c[0])
+            candidate_placements_filtered = len(candidate_placements) - num_extpts_to_try
+            counter_filt5.update(candidate_placements_filtered)
+            count_filt5 += candidate_placements_filtered
+            candidate_placements = candidate_placements[:num_extpts_to_try]
 
-                    if symbreak_key is not None and symbreak_key > (dims, x, y):                            # Filter 2 (Symmetry Breaking): if a comparison key is registered and the candidate placement is smaller than the key (checked value by value in the tuples ((dx, dy, dz), x, y) ), prune branch as it would lead to an identical resultant pallet in terms of dimensions but with different boxes (of the same or different box IDs, like a type 8 or 10 box, which are dimensionally identical) occupying the same place.
-                        counter_symbreak.update(1)
-                        count_symbreak += 1
-                        continue
+        # Iterate through valid candidate placements, attempt to place box, and recurse after each valid placement
+        for _, dims, x, y in candidate_placements:
+            if not use_guarantee:                                                                           # Filter 1 (Deduplication): if optimality need not be guaranteed, check if placing the box in the same orientation at another extreme point leads to the same resultant z-height. This is likely to lead to a very similar heightmap structure, so prune all these candidate branches except for one representative. 
+                z = pallet.get_max_height_in_area(x, y, dims[0], dims[1])
+                profile_key = (dims, z)
+                if profile_key in seen_profiles:
+                    counter_filt1.update(1)
+                    count_filt1 += 1
+                    continue
+                seen_profiles.add(profile_key)
 
-                    delta = pallet.place_box(dims, x, y)                                                    # Place box if branch not filtered
-                    if not delta:
-                        continue
+            if filt2_key is not None and filt2_key > (dims, x, y):                                          # Filter 2 (Symmetry Breaking): if a comparison key is registered and the candidate placement is smaller than the key (checked value by value in the tuples ((dx, dy, dz), x, y) ), prune branch as it would lead to an identical resultant pallet in terms of dimensions but with different boxes (of the same or different box IDs, like a type 8 or 10 box, which are dimensionally identical) occupying the same place.
+                counter_filt2.update(1)
+                count_filt2 += 1
+                continue
 
-                    current_sequence.append((dims, x, y))                                                   # Add placement to sequence and recurse
-                    pbar.update(1)
-                    count_nodes += 1
-                    recursive_place(box_index + 1)
-                    current_sequence.pop()
-                    pallet.remove_box(delta)
+            delta = pallet.place_box(dims, x, y)                                                            # Place box if branch not filtered
+            if not delta:
+                continue
+
+            current_sequence.append((dims, x, y))                                                           # Add placement to sequence and recurse
+            pbar.update(1)
+            count_nodes += 1
+            recursive_place(box_index + 1)
+            current_sequence.pop()
+            pallet.remove_box(delta)
 
     # Initialize non-tqdm counters for nodes and pruning for metrics extraction
     count_nodes         = 0
     count_bound1        = 0
     count_bound4        = 0
-    count_dedupe        = 0
-    count_symbreak      = 0
+    count_filt1         = 0
+    count_filt2         = 0
+    count_filt5         = 0
 
     # Start the recursive search starting with the first box (index 0) and keep track of branches and bounds
     pbar                = tqdm(desc="Evaluating Placements", unit=" nodes", leave=leave_tqdm, total=1766249) # Total is set to previous best to estimate time
-    counter_bound1      = tqdm(desc="Number of branches pruned by bounding rule 1", unit=" prunes", leave=leave_tqdm)
-    counter_bound4      = tqdm(desc="Number of branches pruned by bounding rule 4", unit=" prunes", leave=leave_tqdm)
-    counter_dedupe      = tqdm(desc="Number of branches pruned by deduplication rule", unit=" prunes", leave=leave_tqdm)
-    counter_symbreak    = tqdm(desc="Number of branches pruned by symmetry breaking rule",unit=" prunes", leave=leave_tqdm)
+    counter_bound1      = tqdm(desc="Number of branches pruned by bounding rule 1",     unit=" prunes", leave=leave_tqdm)
+    counter_bound4      = tqdm(desc="Number of branches pruned by bounding rule 4",     unit=" prunes", leave=leave_tqdm)
+    counter_filt1       = tqdm(desc="Number of branches filtered by deduplication",     unit=" prunes", leave=leave_tqdm)
+    counter_filt2       = tqdm(desc="Number of branches filtered by symmetry breaking", unit=" prunes", leave=leave_tqdm)
+    counter_filt5       = tqdm(desc="Number of branches filtered by top-x limiting",    unit=" prunes", leave=leave_tqdm)
     recursive_place(0)
 
     # Reconstruct the optimal pallet state using the best sequence found
@@ -1000,10 +1018,12 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
         'nodes':                count_nodes,
         'pruned_rule1':         count_bound1,
         'pruned_rule4':         count_bound4,
-        'pruned_dedupe':        count_dedupe,
-        'pruned_symbreak':      count_symbreak,
+        'pruned_filt1':         count_filt1,
+        'pruned_filt2':         count_filt2,
+        'pruned_filt5':         count_filt5,
         'best_score':           best_score,
         'optimality_guarantee': use_guarantee,
+        'topx_limit':           num_extpts_to_try
     }
     return bnb_stats
 
@@ -1110,8 +1130,9 @@ def run_optimality_guarantee_test(start_order=1, end_order=None, order_dict=test
         nodes_diff, nodes_factor    = calculate_row_difference(stats_no_guarantee['nodes'],                 stats_with_guarantee['nodes'])
         r1_diff,    r1_factor       = calculate_row_difference(stats_no_guarantee['pruned_rule1'],          stats_with_guarantee['pruned_rule1'])
         r4_diff,    r4_factor       = calculate_row_difference(stats_no_guarantee['pruned_rule4'],          stats_with_guarantee['pruned_rule4'])
-        dd_diff,    dd_factor       = calculate_row_difference(stats_no_guarantee['pruned_dedupe'],         stats_with_guarantee['pruned_dedupe'])
-        sb_diff,    sb_factor       = calculate_row_difference(stats_no_guarantee['pruned_symbreak'],       stats_with_guarantee['pruned_symbreak'])
+        f1_diff,    f1_factor       = calculate_row_difference(stats_no_guarantee['pruned_filt1'],          stats_with_guarantee['pruned_filt1'])
+        f2_diff,    f2_factor       = calculate_row_difference(stats_no_guarantee['pruned_filt2'],          stats_with_guarantee['pruned_filt2'])
+        f5_diff,    f5_factor       = calculate_row_difference(stats_no_guarantee['pruned_filt5'],          stats_with_guarantee['pruned_filt5'])
 
         result_rows.append({
             'order_id':                 order_id,
@@ -1133,16 +1154,21 @@ def run_optimality_guarantee_test(start_order=1, end_order=None, order_dict=test
             'r4_with_guarantee':        stats_with_guarantee['pruned_rule4'],
             'r4_diff_abs':              r4_diff,
             'r4_diff_factor':           r4_factor,
-            # Pruned by deduplication
-            'dedupe_no_guarantee':      stats_no_guarantee['pruned_dedupe'],
-            'dedupe_with_guarantee':    stats_with_guarantee['pruned_dedupe'],
-            'dedupe_diff_abs':          dd_diff,
-            'dedupe_diff_factor':       dd_factor,
-            # Pruned by symmetry breaking
-            'symbreak_no_guarantee':    stats_no_guarantee['pruned_symbreak'],
-            'symbreak_with_guarantee':  stats_with_guarantee['pruned_symbreak'],
-            'symbreak_diff_abs':        sb_diff,
-            'symbreak_diff_factor':     sb_factor,
+            # Filtered by deduplication
+            'filt1_no_guarantee':       stats_no_guarantee['pruned_filt1'],
+            'filt1_with_guarantee':     stats_with_guarantee['pruned_filt1'],
+            'filt1_diff_abs':           f1_diff,
+            'filt1_diff_factor':        f1_factor,
+            # Filtered by symmetry breaking
+            'filt2_no_guarantee':       stats_no_guarantee['pruned_filt2'],
+            'filt2_with_guarantee':     stats_with_guarantee['pruned_filt2'],
+            'filt2_diff_abs':           f2_diff,
+            'filt2_diff_factor':        f2_factor,
+            # Filtered by symmetry breaking
+            'filt5_no_guarantee':       stats_no_guarantee['pruned_filt2'],
+            'filt5_with_guarantee':     stats_with_guarantee['pruned_filt2'],
+            'filt5_diff_abs':           f5_diff,
+            'filt5_diff_factor':        f5_factor,
         })
 
         print(f"----------------------------------------------------------------------------------------------------------------------------")
@@ -1170,7 +1196,7 @@ current_metric = Metric.MAX_Z
 
 if NOTEBOOK_MODE == True:
     if current_algo == Algorithm.BNB:
-        testpallet, bnb_stats = process_order(current_orderID, algo=current_algo, criterion=current_criterion, order_dict=current_order_dict, metric=current_metric)
+        testpallet, bnb_stats = process_order(current_orderID, algo=current_algo, criterion=current_criterion, order_dict=current_order_dict, metric=current_metric, num_extpts_to_try=3)
         testpallet.get_pallet_results(current_algo, current_orderID, current_order_dict, print_mode=True, bnb_stats=bnb_stats)
     else:
         testpallet = process_order(current_orderID, algo=current_algo, criterion=current_criterion, order_dict=current_order_dict, metric=current_metric)
