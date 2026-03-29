@@ -3,6 +3,8 @@
 
 # %%
 import sys
+import time
+import math
 import numpy as np
 import pandas as pd
 from enum import Enum
@@ -902,7 +904,7 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
 
     def recursive_place(box_index):                                                                         # Define recursive function to place boxes one by one and prune as needed
         # Take variables into local scope of the recursive function
-        nonlocal best_score, best_sequence, count_nodes, count_bound1, count_bound4, count_filt1, count_filt2
+        nonlocal best_score, best_sequence, count_nodes, count_bound1, count_bound4, count_filt1, count_filt2, count_filt5
 
         # BASE CASE: if all boxes are placed, evaluate score and update best if needed
         if box_index == len(sorted_box_list):
@@ -1184,6 +1186,78 @@ def run_optimality_guarantee_test(start_order=1, end_order=None, order_dict=test
     print(f"Results saved to: {output_csv}")
     return results_df
 
+def run_topx_limiting_test(start_order=1, end_order=None, order_dict=test_orders_dict, criterion=DEFAULT_CRITERION, print_pallets=False, save_pallets=False, topx_min=1, topx_max=5, topx_step=1, topx_test_without=True):     # Run BnB with a range of top-X candidate limits on a range of orders and export a comparison CSV
+    # If no final order is specified, run until the end of the dict
+    if end_order is None:
+        end_order = max(order_dict.keys())
+
+    # Get the order IDs to test between the start and end order IDs
+    order_ids = [order_id for order_id in sorted(order_dict.keys()) if start_order <= order_id <= end_order]
+
+    # Generate list of limits to test
+    topx_values_to_test = list(range(topx_min, topx_max + 1, topx_step))
+    if topx_test_without:
+        topx_values_to_test.append(None) # None will trigger the standard, unfiltered BnB run
+
+    result_rows = []
+
+    for order_id in tqdm(order_ids, desc="Testing orders", unit=" orders"):
+        starttime = time.time()
+        print(f"\n----------------------------------------------------------------------------------------------------------------------------")
+        print(f"----------------------------------------------------------------------------------------------------------------------------")
+        print(f"Running order {order_id} at timestamp {starttime}...")
+        
+        box_list = get_box_list_from_order(order_id, order_dict)
+
+        for topx_val in topx_values_to_test:
+            limit_label = f"Top-{topx_val}" if topx_val is not None else "No Limit"
+            print(f"\n  Running with {limit_label}...")
+
+            pallet = Pallet()
+            
+            # Run BnB
+            stats = place_box_list_branch_and_bound(pallet, box_list, criterion=criterion, leave_tqdm=False, optimality_guarantee=False, num_extpts_to_try=topx_val)
+            score = pallet.get_max_height()
+            
+            # Get results based on print and save mode
+            pallet.get_pallet_results(algo=Algorithm.BNB, orderID=order_id, order_dict=order_dict, print_mode=print_pallets, save_mode=save_pallets, bnb_stats=stats)
+
+            # Record metrics
+            total_pruned = (stats['pruned_rule1'] + stats['pruned_rule4'] + stats['pruned_filt1'] + stats['pruned_filt2'] + stats['pruned_filt5'])
+            endtime = time.time()
+            secs_taken = endtime - starttime
+            mins_taken = math.floor(secs_taken/60)
+            restseconds = secs_taken % 60
+
+            result_rows.append({
+                'order_id'        : order_id,
+                'topx_limit'      : topx_val if topx_val is not None else -1,
+                'time_taken (min)': mins_taken,
+                '(seconds)'       : restseconds,
+                'score'           : score,
+                'nodes'           : stats['nodes'],
+                'pruned_rule1'    : stats['pruned_rule1'],
+                'pruned_rule4'    : stats['pruned_rule4'],
+                'pruned_filt1'    : stats['pruned_filt1'],
+                'pruned_filt2'    : stats['pruned_filt2'],
+                'pruned_filt5'    : stats['pruned_filt5'],
+                'total_pruned'    : total_pruned,
+            })
+
+            print(f"Finished! Score: {score} | Nodes: {stats['nodes']:,} | Filter 5 Prunes: {stats['pruned_filt5']:,} | Time taken: {secs_taken} seconds")
+
+    # Export to CSV
+    output_csv = f"./results/bnb_comparisons/topx_test_O{start_order}-O{end_order}_L{topx_min}-L{topx_max}-S{topx_step}.csv"
+    results_df = pd.DataFrame(result_rows)
+    results_df.to_csv(output_csv, index=False)
+    
+    print(f"\n----------------------------------------------------------------------------------------------------------------------------")
+    print(f"----------------------------------------------------------------------------------------------------------------------------")
+    print(f"----------------------------------------------------------------------------------------------------------------------------")
+    print(f"Testing complete! Results saved to: {output_csv}")
+    
+    return results_df
+
 # %% [markdown]
 # #### Testing Area
 
@@ -1193,10 +1267,11 @@ current_orderID = 25
 current_algo = Algorithm.BNB
 current_criterion = Criterion.VOLUME
 current_metric = Metric.MAX_Z
+current_nett = None
 
 if NOTEBOOK_MODE == True:
     if current_algo == Algorithm.BNB:
-        testpallet, bnb_stats = process_order(current_orderID, algo=current_algo, criterion=current_criterion, order_dict=current_order_dict, metric=current_metric, num_extpts_to_try=3)
+        testpallet, bnb_stats = process_order(current_orderID, algo=current_algo, criterion=current_criterion, order_dict=current_order_dict, metric=current_metric, num_extpts_to_try=current_nett)
         testpallet.get_pallet_results(current_algo, current_orderID, current_order_dict, print_mode=True, bnb_stats=bnb_stats)
     else:
         testpallet = process_order(current_orderID, algo=current_algo, criterion=current_criterion, order_dict=current_order_dict, metric=current_metric)

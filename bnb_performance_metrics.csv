@@ -5,22 +5,22 @@
 # First tests done on Test Order 15 (15 boxes)
 # Second batch done on Test Order 25 (25 boxes)
 
-"ADDITION","TIME_TO_COMPLETE(min)","(sec)","NODES_COMPUTED","AVG_NPS",BEST_SCORE,"PRUNED_RULE1","PRUNED_RULE2","PRUNED_RULE3","PRUNED_RULE4","PRUNED_DEDUP","PRUNED_SYMBREAK","PRUNED_HM_REC","PRUNED_TS",NOTES
+"ADDITION","TIME_TO_COMPLETE(min)","(sec)","NODES_COMPUTED","AVG_NPS",BEST_SCORE,"PRUNED_RULE1","PRUNED_RULE2","PRUNED_RULE3","PRUNED_RULE4","PRUNED_DEDUP","PRUNED_SYMBREAK","PRUNED_HM_REC","PRUNED_TS","PRUNED_TX",NOTES
 
-"BnB Algorithm",17,03,4354054,4462,260,4354051,0,0,0,0,0,0,0,"Initial version with only trivial rule"
-"FFD score initialization",16,45,4349175,4374,260,4349171,0,0,0,0,0,0,0,"Extremely slight improvement due to high score usually being found fast enough without warm start"
-"Bounding rule 2 (volume)",17,38,4349175,4243,260,4349171,0,0,0,0,0,0,0,"No improvements due to bounding rule 2 never triggering."
-"Bounding rule 2 refinement",16,49,4349175,4360,260,4349171,0,0,0,0,0,0,0,"No improvement due to rule 2 still not being aggresive enough."
-"Bounding rule 3 (look-ahead)",17,02,4349175,4327,260,4248711,0,0,0,0,0,0,0,"Bounding rule 3 also does not fire."
-"Bounding rule 4 (tall-low)",13,17,2122024,2745,260,2021560,0,0,50004,0,0,0,0,"Rule 4 does a magnificent job of pruning branches early, leading to a faster finish even with almost a third slower nodes per second processing speed."
-"Rule 2 final form",13,55,22122024,2576,260,2021560,0,0,50004,0,0,0,0,"Rule 2 update has still not made it fire once."
-"Deduplication rule addition",00,29,188559,1714,260,16673,0,0,664,21378,0,0,0,"An incredible optimization. Now to check whether the results are much more unoptimal or not."
-"Symmetry breaking rule addition",00,03,4329,1246,260,3569,0,0,182,8373,2987,0,0,"Another breakthrough! Turns out that testing a bunch of randomly generated boxes leads you to the understanding that having a bunch of the same box dimension leads to combinatorial explosions and deduplication / symmetry breakage must occur for computation timeframes to be reasonable, optimality guarantee or not."
+"BnB Algorithm",17,03,4354054,4462,260,4354051,0,0,0,0,0,0,0,,"Initial version with only trivial rule"
+"FFD score initialization",16,45,4349175,4374,260,4349171,0,0,0,0,0,0,0,,"Extremely slight improvement due to high score usually being found fast enough without warm start"
+"Bounding rule 2 (volume)",17,38,4349175,4243,260,4349171,0,0,0,0,0,0,0,,"No improvements due to bounding rule 2 never triggering."
+"Bounding rule 2 refinement",16,49,4349175,4360,260,4349171,0,0,0,0,0,0,0,,"No improvement due to rule 2 still not being aggresive enough."
+"Bounding rule 3 (look-ahead)",17,02,4349175,4327,260,4248711,0,0,0,0,0,0,0,,"Bounding rule 3 also does not fire."
+"Bounding rule 4 (tall-low)",13,17,2122024,2745,260,2021560,0,0,50004,0,0,0,0,,"Rule 4 does a magnificent job of pruning branches early, leading to a faster finish even with almost a third slower nodes per second processing speed."
+"Rule 2 final form",13,55,22122024,2576,260,2021560,0,0,50004,0,0,0,0,,"Rule 2 update has still not made it fire once."
+"Deduplication filter addition",00,29,188559,1714,260,16673,0,0,664,21378,0,0,0,,"An incredible optimization. Now to check whether the results are much more unoptimal or not."
+"Symmetry breaking filter addition",00,03,4329,1246,260,3569,0,0,182,8373,2987,0,0,,"Another breakthrough! Turns out that testing a bunch of randomly generated boxes leads you to the understanding that having a bunch of the same box dimension leads to combinatorial explosions and deduplication / symmetry breakage must occur for computation timeframes to be reasonable, optimality guarantee or not."
 
-"Benchmark difficulty increase",24,48,1766249,948,333,1591909,0,0,33057,3047645,1942589,0,0,"No code changes, but performance benchmarks from here on out will be done on test order 25 (25 boxes) due to achieving trivialization of test order 15."
-"Rule 2 deprecation + optimizations",23,31,1766249,971,333,1591909,0,0,33057,3047645,1942589,0,0,"Very small optimization. Should consider more."
-"Heightmap recognition rule addition",61,55,1756995,424,333,1584383,0,0,32009,3028995,1930085,1287,0,"Shame that such a smart bound on paper results in neglegible pruning, at the cost of so much performance. This rule can go immediately."
-"HM rec deprecation + optimization",23,36,1766249,986,333,1591909,0,0,33057,3047645,1942589,0,0,"A small problem where things were doubly calculated was fixed along with the deprecation of the heightmap recognition rule."
-"Two Surface rule addition",23,54,1728994,905,333,1558727,0,0,32150,1253485,1901481,0,1750732,"Failed experiment. Turns out the existing extreme point logic already took care of most of what this rule aimed to do."
-"Two Surface rule deprecation",23,37,1766249,986,333,1591909,0,0,33057,3047645,1942589,0,0,"Back to baseline"
-"",0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+"Benchmark difficulty increase",24,48,1766249,948,333,1591909,0,0,33057,3047645,1942589,0,0,,"No code changes, but performance benchmarks from here on out will be done on test order 25 (25 boxes) due to achieving trivialization of test order 15."
+"Rule 2 deprecation + optimizations",23,31,1766249,971,333,1591909,0,0,33057,3047645,1942589,0,0,,"Very small optimization. Should consider more."
+"Heightmap recognition filter addition",61,55,1756995,424,333,1584383,0,0,32009,3028995,1930085,1287,0,,"Shame that such a smart bound on paper results in neglegible pruning, at the cost of so much performance. This rule can go immediately."
+"HM rec deprecation + optimization",23,36,1766249,986,333,1591909,0,0,33057,3047645,1942589,0,0,,"A small problem where things were doubly calculated was fixed along with the deprecation of the heightmap recognition rule."
+"Two Surface filter addition",23,54,1728994,905,333,1558727,0,0,32150,1253485,1901481,0,1750732,,"Failed experiment. Turns out the existing extreme point logic already took care of most of what this rule aimed to do."
+"Two Surface filter deprecation",23,37,1766249,986,333,1591909,0,0,33057,3047645,1942589,0,0,,"Back to baseline"
+"Top-X candidate limiting filter addition",0,0,0,0,0,0,0,0,0,0,0,0,0,0
