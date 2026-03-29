@@ -959,10 +959,11 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
 
         if not use_guarantee and num_extpts_to_try is not None:                                             # Filter 5 (Top-X candidates): if optimality need not be guaranteed and candidate limit is specified, score all orientation + placement candidates by resultant box height, then lowest x+y placement, and only branch on the top X scoring candidates
             candidate_placements.sort(key=lambda c: c[0])
-            candidate_placements_filtered = len(candidate_placements) - num_extpts_to_try
-            counter_filt5.update(candidate_placements_filtered)
-            count_filt5 += candidate_placements_filtered
+            candidate_placements_filtered = max(0, len(candidate_placements) - num_extpts_to_try)
             candidate_placements = candidate_placements[:num_extpts_to_try]
+            if candidate_placements_filtered > 0:
+                counter_filt5.update(candidate_placements_filtered)
+                count_filt5 += candidate_placements_filtered
 
         # Iterate through valid candidate placements, attempt to place box, and recurse after each valid placement
         for _, dims, x, y in candidate_placements:
@@ -1202,14 +1203,14 @@ def run_topx_limiting_test(start_order=1, end_order=None, order_dict=test_orders
     result_rows = []
 
     for order_id in tqdm(order_ids, desc="Testing orders", unit=" orders"):
-        starttime = time.time()
         print(f"\n----------------------------------------------------------------------------------------------------------------------------")
         print(f"----------------------------------------------------------------------------------------------------------------------------")
-        print(f"Running order {order_id} at timestamp {starttime}...")
+        print(f"Running order {order_id}...")
         
         box_list = get_box_list_from_order(order_id, order_dict)
 
         for topx_val in topx_values_to_test:
+            starttime = int(time.time())
             limit_label = f"Top-{topx_val}" if topx_val is not None else "No Limit"
             print(f"\n  Running with {limit_label}...")
 
@@ -1224,7 +1225,7 @@ def run_topx_limiting_test(start_order=1, end_order=None, order_dict=test_orders
 
             # Record metrics
             total_pruned = (stats['pruned_rule1'] + stats['pruned_rule4'] + stats['pruned_filt1'] + stats['pruned_filt2'] + stats['pruned_filt5'])
-            endtime = time.time()
+            endtime = int(time.time())
             secs_taken = endtime - starttime
             mins_taken = math.floor(secs_taken/60)
             restseconds = secs_taken % 60
@@ -1269,15 +1270,16 @@ current_criterion = Criterion.VOLUME
 current_metric = Metric.MAX_Z
 current_nett = None
 
-if NOTEBOOK_MODE == True:
-    if current_algo == Algorithm.BNB:
-        testpallet, bnb_stats = process_order(current_orderID, algo=current_algo, criterion=current_criterion, order_dict=current_order_dict, metric=current_metric, num_extpts_to_try=current_nett)
-        testpallet.get_pallet_results(current_algo, current_orderID, current_order_dict, print_mode=True, bnb_stats=bnb_stats)
-    else:
-        testpallet = process_order(current_orderID, algo=current_algo, criterion=current_criterion, order_dict=current_order_dict, metric=current_metric)
-        testpallet.get_pallet_results(current_algo, current_orderID, current_order_dict, print_mode=True)
-else:
-    run_optimality_guarantee_test(start_order=1800, end_order=1800, order_dict=test_orders_dict, print_pallets=True, save_pallets=False)
+# if NOTEBOOK_MODE == True:
+#     if current_algo == Algorithm.BNB:
+#         testpallet, bnb_stats = process_order(current_orderID, algo=current_algo, criterion=current_criterion, order_dict=current_order_dict, metric=current_metric, num_extpts_to_try=current_nett)
+#         testpallet.get_pallet_results(current_algo, current_orderID, current_order_dict, print_mode=True, bnb_stats=bnb_stats)
+#     else:
+#         testpallet = process_order(current_orderID, algo=current_algo, criterion=current_criterion, order_dict=current_order_dict, metric=current_metric)
+#         testpallet.get_pallet_results(current_algo, current_orderID, current_order_dict, print_mode=True)
+# else:
+#     run_optimality_guarantee_test(start_order=1800, end_order=1800, order_dict=test_orders_dict, print_pallets=True, save_pallets=False)
 
+run_topx_limiting_test(1000, 1000, test_orders_dict, DEFAULT_CRITERION, True, False, 1, 50, 1, True)
 
 
