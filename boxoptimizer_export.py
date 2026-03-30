@@ -5,6 +5,7 @@
 import sys
 import time
 import math
+import concurrent
 import numpy as np
 import pandas as pd
 from enum import Enum
@@ -49,24 +50,24 @@ MINIMIZE_METRICS = [Metric.COG_Z, Metric.MAX_Z]
 # #### Global Settings
 
 # %%
-PALLET_DIMS = (1000, 1400, 1400)                                                # Length, width, height (X, Y, Z, respectively) in mm
-DEFAULT_MAX_ATTEMPTS = 2000                                                     # Default cutoff for random attempts to place boxes
-DEFAULT_CRITERION = Criterion.VOLUME                                            # Default criterion for box sorting
-DEFAULT_OPTIMIZATION_METRIC = Metric.MAX_Z                                      # Default score to optimize best fit algorithms for
-DEFAULT_ALGORITHM = Algorithm.BFD                                               # Default box placement algorithm
-ML_OBSERVATION_SCALE_FACTOR = 10                                                # Scale factor to scale down height map observations for ML model input
-SUPPORTED_AREA_PERCENTAGE = 70                                                  # Percentage of pallet area that must be supported under a box for it to be placed
-HOR_ROTATION_ALLOWED_DEFAULT = True                                             # Default value of whether boxes may be rotated horizontally
-VER_ROTATION_ALLOWED_DEFAULT = True                                             # Default value of whether boxes may be rotated vertically
-BNB_OPTIMALITY_GUARANTEE = False                                                # Disable any code that would sacrifice the guarantee that the BnB algorithm's outcome is the optimal one
+PALLET_DIMS                     = (1000, 1400, 1400)                            # Length, width, height (X, Y, Z, respectively) in mm
+DEFAULT_CRITERION               = Criterion.VOLUME                              # Default criterion for box sorting
+DEFAULT_OPTIMIZATION_METRIC     = Metric.MAX_Z                                  # Default score to optimize best fit algorithms for
+DEFAULT_ALGORITHM               = Algorithm.BFD                                 # Default box placement algorithm
+HOR_ROTATION_ALLOWED_DEFAULT    = True                                          # Default value of whether boxes may be rotated horizontally
+VER_ROTATION_ALLOWED_DEFAULT    = True                                          # Default value of whether boxes may be rotated vertically
+BNB_OPTIMALITY_GUARANTEE        = False                                         # Disable any code that would sacrifice the guarantee that the BnB algorithm's outcome is the optimal one
+DEFAULT_MAX_ATTEMPTS            = 2000                                          # Default cutoff for random attempts to place boxes
+SUPPORTED_AREA_PERCENTAGE       = 70                                            # Percentage of pallet area that must be supported under a box for it to be placed
+BNB_TOPX_DEFAULT_LIMIT          = 15                                            # Default limit amount for BnB Filter 5
 
 # %% [markdown]
 # #### Data loading and precomputing
 
 # %%
-boxtypes = pd.read_csv("boxtypes.csv")                                          # Load box type dimensions
-orders = pd.read_csv("orders.csv")                                              # Load orders data
-test_orders = pd.read_csv("orders_test.csv")                                    # Load test orders data
+boxtypes = pd.read_csv("./data/boxtypes.csv")                                   # Load box type dimensions
+orders = pd.read_csv("./data/orders.csv")                                       # Load orders data
+test_orders = pd.read_csv("./data/orders_test.csv")                             # Load test orders data
 
 # Turn dataframes into dicts for instant access without searching 
 boxtypes_dict = boxtypes.set_index('ID').to_dict('index')
@@ -691,7 +692,7 @@ def process_order(order, algo, max_attempts=DEFAULT_MAX_ATTEMPTS, criterion=DEFA
         return pallet
 
     elif algo == Algorithm.BNB:
-        bnb_stats = place_box_list_branch_and_bound(pallet, box_list, criterion=criterion, leave_tqdm=leave_tqdm, optimality_guarantee=optimality_guarantee, num_extpts_to_try=num_extpts_to_try)
+        bnb_stats = place_box_list_branch_and_bound(pallet, box_list, criterion=criterion, leave_tqdm=leave_tqdm, optimality_guarantee=optimality_guarantee, num_extpts_to_try=BNB_TOPX_DEFAULT_LIMIT)
         return pallet, bnb_stats
 
 def get_box_orientations(dx, dy, dz, rot_h=HOR_ROTATION_ALLOWED_DEFAULT, rot_v=VER_ROTATION_ALLOWED_DEFAULT):                           # Get a list of possible orientations for a box with given dimensions, based on allowed rotations
@@ -1268,18 +1269,34 @@ current_orderID = 25
 current_algo = Algorithm.BNB
 current_criterion = Criterion.VOLUME
 current_metric = Metric.MAX_Z
-current_nett = None
+current_nett = BNB_TOPX_DEFAULT_LIMIT
 
-# if NOTEBOOK_MODE == True:
-#     if current_algo == Algorithm.BNB:
-#         testpallet, bnb_stats = process_order(current_orderID, algo=current_algo, criterion=current_criterion, order_dict=current_order_dict, metric=current_metric, num_extpts_to_try=current_nett)
-#         testpallet.get_pallet_results(current_algo, current_orderID, current_order_dict, print_mode=True, bnb_stats=bnb_stats)
-#     else:
-#         testpallet = process_order(current_orderID, algo=current_algo, criterion=current_criterion, order_dict=current_order_dict, metric=current_metric)
-#         testpallet.get_pallet_results(current_algo, current_orderID, current_order_dict, print_mode=True)
-# else:
-#     run_optimality_guarantee_test(start_order=1800, end_order=1800, order_dict=test_orders_dict, print_pallets=True, save_pallets=False)
-
-run_topx_limiting_test(1000, 1000, test_orders_dict, DEFAULT_CRITERION, True, False, 1, 50, 1, True)
+if NOTEBOOK_MODE == True:
+    if current_algo == Algorithm.BNB:
+        testpallet, bnb_stats = process_order(current_orderID, algo=current_algo, criterion=current_criterion, order_dict=current_order_dict, metric=current_metric, num_extpts_to_try=current_nett)
+        testpallet.get_pallet_results(current_algo, current_orderID, current_order_dict, print_mode=True, bnb_stats=bnb_stats)
+    else:
+        testpallet = process_order(current_orderID, algo=current_algo, criterion=current_criterion, order_dict=current_order_dict, metric=current_metric)
+        testpallet.get_pallet_results(current_algo, current_orderID, current_order_dict, print_mode=True)
+else:
+    orders_to_go = []
+    for i in range(1000, 4000, 1):
+        orders_to_go.append(i)
+        
+    with concurrent.futures.ProcessPoolExecutor(max_workers=125) as executor:
+        for i in orders_to_go:
+            executor.submit(
+                run_topx_limiting_test, 
+                start_order=i, 
+                end_order=i, 
+                order_dict=test_orders_dict, 
+                criterion=DEFAULT_CRITERION,
+                print_pallets=False, 
+                save_pallets=False, 
+                topx_min=1, 
+                topx_max=current_nett, 
+                topx_step=1, 
+                topx_test_without=True
+                )
 
 

@@ -23,4 +23,4 @@
 "HM rec deprecation + optimization",23,36,1766249,986,333,1591909,0,0,33057,3047645,1942589,0,0,,"A small problem where things were doubly calculated was fixed along with the deprecation of the heightmap recognition rule."
 "Two Surface filter addition",23,54,1728994,905,333,1558727,0,0,32150,1253485,1901481,0,1750732,,"Failed experiment. Turns out the existing extreme point logic already took care of most of what this rule aimed to do."
 "Two Surface filter deprecation",23,37,1766249,986,333,1591909,0,0,33057,3047645,1942589,0,0,,"Back to baseline"
-"Top-X candidate limiting filter addition",0,0,0,0,0,0,0,0,0,0,0,0,0,0
+"Top-X candidate limiting filter (15)",0,0,0,0,0,0,0,0,0,0,0,0,0,0,"The final form."
