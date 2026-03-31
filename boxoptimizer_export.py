@@ -60,7 +60,7 @@ VER_ROTATION_ALLOWED_DEFAULT    = True                                          
 BNB_OPTIMALITY_GUARANTEE        = False                                         # Disable any code that would sacrifice the guarantee that the BnB algorithm's outcome is the optimal one
 DEFAULT_MAX_ATTEMPTS            = 2000                                          # Default cutoff for random attempts to place boxes
 SUPPORTED_AREA_PERCENTAGE       = 70                                            # Percentage of pallet area that must be supported under a box for it to be placed
-BNB_TOPX_DEFAULT_LIMIT          = 15                                            # Default limit amount for BnB Filter 5
+BNB_TOPX_DEFAULT_LIMIT          = 5                                             # Default limit amount for BnB Filter 5
 
 # %% [markdown]
 # #### Data loading and precomputing
@@ -1341,7 +1341,6 @@ def run_algorithm_comparison_test(start_order=1, end_order=None, order_dict=test
             print(f"    -> Finished {algo.value.upper()} | Score: {max_z} | Fulfillment: {fulfillment}% | Time: {secs_taken}s")
 
     # Export to csv
-    os.makedirs("./results/algo_comparisons", exist_ok=True)
     output_csv = f"./results/algo_comparisons/algorithm_comparison_O{start_order}_to_O{end_order}.csv"
     results_df = pd.DataFrame(result_rows)
     results_df.to_csv(output_csv, index=False)
@@ -1362,28 +1361,43 @@ current_algo = Algorithm.BNB
 current_criterion = Criterion.VOLUME
 current_metric = Metric.MAX_Z
 current_nett = BNB_TOPX_DEFAULT_LIMIT
+testing_topx_given_orders = True
+orders_to_go = []
+for i in range(1, 40, 1):
+    orders_to_go.append(i)
 
-if NOTEBOOK_MODE == True:
+if NOTEBOOK_MODE:
     if current_algo == Algorithm.BNB:
         testpallet, bnb_stats = process_order(current_orderID, algo=current_algo, criterion=current_criterion, order_dict=current_order_dict, metric=current_metric, num_extpts_to_try=current_nett)
         testpallet.get_pallet_results(current_algo, current_orderID, current_order_dict, print_mode=True, bnb_stats=bnb_stats)
     else:
         testpallet = process_order(current_orderID, algo=current_algo, criterion=current_criterion, order_dict=current_order_dict, metric=current_metric)
         testpallet.get_pallet_results(current_algo, current_orderID, current_order_dict, print_mode=True)
+elif testing_topx_given_orders:
+    with concurrent.futures.ProcessPoolExecutor(max_workers=125) as executor:
+        for i in orders_to_go:
+            executor.submit(
+                run_topx_limiting_test, 
+                start_order=i, 
+                end_order=i, 
+                order_dict=orders_dict, 
+                print_pallets=False, 
+                save_pallets=True,
+                topx_min = 1,
+                topx_max= 5,
+                topx_step= 1,
+                topx_test_without= True
+                )
 else:
-    orders_to_go = []
-    for i in range(1000, 4000, 1):
-        orders_to_go.append(i)
-        
     with concurrent.futures.ProcessPoolExecutor(max_workers=125) as executor:
         for i in orders_to_go:
             executor.submit(
                 run_algorithm_comparison_test, 
                 start_order=i, 
                 end_order=i, 
-                order_dict=test_orders_dict, 
+                order_dict=orders_dict, 
                 print_pallets=False, 
-                save_pallets=False,
+                save_pallets=True,
                 )
 
 
