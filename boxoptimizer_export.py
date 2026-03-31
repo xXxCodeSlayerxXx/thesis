@@ -2,6 +2,7 @@
 # #### Imports
 
 # %%
+import os
 import sys
 import time
 import math
@@ -1260,6 +1261,97 @@ def run_topx_limiting_test(start_order=1, end_order=None, order_dict=test_orders
     
     return results_df
 
+def run_algorithm_comparison_test(start_order=1, end_order=None, order_dict=test_orders_dict, criterion=DEFAULT_CRITERION, metric=Metric.MAX_Z, print_pallets=False, save_pallets=False, random_attempts=DEFAULT_MAX_ATTEMPTS, bnb_topx=BNB_TOPX_DEFAULT_LIMIT):     
+    # If no final order is specified, run until the end of the dict
+    if end_order is None:
+        end_order = max(order_dict.keys())
+
+    # Get the order IDs to test between the start and end order IDs
+    order_ids = [order_id for order_id in sorted(order_dict.keys()) if start_order <= order_id <= end_order]
+
+    # Determine dataset name for the save directory
+    dataset_name = "orders" if order_dict is orders_dict else "test_orders"
+    dataset_label = "GivenOrders" if order_dict is orders_dict else "TestOrders"
+
+    result_rows = []
+
+    for order_id in tqdm(order_ids, desc="Testing orders across algorithms", unit=" orders"):
+        print(f"\n----------------------------------------------------------------------------------------------------------------------------")
+        print(f"----------------------------------------------------------------------------------------------------------------------------")
+        print(f"Running order {order_id}...")
+        
+        # Iterate over every algorithm in the Enum
+        for algo in Algorithm:
+            print(f"\n  Running {algo.value.upper()}...")
+            starttime = time.time()
+            
+            # Process the order based on the algorithm type
+            if algo == Algorithm.BNB:
+                pallet, bnb_stats = process_order(order_id, algo, criterion=criterion, metric=metric, order_dict=order_dict, leave_tqdm=False, optimality_guarantee=False, num_extpts_to_try=bnb_topx)
+            else:
+                pallet = process_order(order_id, algo, max_attempts=random_attempts, criterion=criterion, metric=metric, order_dict=order_dict, leave_tqdm=False)
+                bnb_stats = None
+                
+            endtime = time.time()
+            secs_taken = round(endtime - starttime, 4)
+            
+            # Extract metrics
+            fulfillment = pallet.check_order_fullfillment(order_id, order_dict)
+            volume_util = pallet.get_volume_utilization()
+            area_usage_z0 = pallet.get_area_usage_at_z(0)
+            cog_z = pallet.get_center_of_gravity_z()
+            packing_score = pallet.get_packing_score()
+            max_z = pallet.get_max_height()
+            
+            # Print and/or save the pallet visualizations
+            pallet.get_pallet_results(algo=algo, orderID=order_id, order_dict=order_dict, print_mode=print_pallets, save_mode=save_pallets, bnb_stats=bnb_stats)
+            
+            # Collate run data
+            row_data = {
+                'order_id': order_id,
+                'algorithm': algo.value.upper(),
+                'time_taken (s)': secs_taken,
+                'score (max_z)': max_z,
+                'packing_score': packing_score,
+                'fulfillment (%)': fulfillment,
+                'volume_util (%)': volume_util,
+                'area_usage_z0 (%)': area_usage_z0,
+                'cog_z': cog_z,
+            }
+            
+            # Add BnB specific stats if applicable, otherwise fill with N/A
+            if algo == Algorithm.BNB and bnb_stats is not None:
+                total_pruned = (bnb_stats['pruned_rule1'] + bnb_stats['pruned_rule4'] + bnb_stats['pruned_filt1'] + bnb_stats['pruned_filt2'] + bnb_stats['pruned_filt5'])
+                row_data.update({
+                    'nodes': bnb_stats['nodes'],
+                    'pruned_rule1': bnb_stats['pruned_rule1'],
+                    'pruned_rule4': bnb_stats['pruned_rule4'],
+                    'pruned_filt1': bnb_stats['pruned_filt1'],
+                    'pruned_filt2': bnb_stats['pruned_filt2'],
+                    'pruned_filt5': bnb_stats['pruned_filt5'],
+                    'total_pruned': total_pruned
+                })
+            else:
+                row_data.update({
+                    'nodes': None, 'pruned_rule1': None, 'pruned_rule4': None,
+                    'pruned_filt1': None, 'pruned_filt2': None, 'pruned_filt5': None, 'total_pruned': None
+                })
+                
+            result_rows.append(row_data)
+            print(f"    -> Finished {algo.value.upper()} | Score: {max_z} | Fulfillment: {fulfillment}% | Time: {secs_taken}s")
+
+    # Export to csv
+    os.makedirs("./results/algo_comparisons", exist_ok=True)
+    output_csv = f"./results/algo_comparisons/algorithm_comparison_O{start_order}_to_O{end_order}.csv"
+    results_df = pd.DataFrame(result_rows)
+    results_df.to_csv(output_csv, index=False)
+    
+    print(f"\n----------------------------------------------------------------------------------------------------------------------------")
+    print(f"----------------------------------------------------------------------------------------------------------------------------")
+    print(f"Testing complete! Results saved to: {output_csv}")
+    
+    return results_df
+
 # %% [markdown]
 # #### Testing Area
 
@@ -1286,17 +1378,12 @@ else:
     with concurrent.futures.ProcessPoolExecutor(max_workers=125) as executor:
         for i in orders_to_go:
             executor.submit(
-                run_topx_limiting_test, 
+                run_algorithm_comparison_test, 
                 start_order=i, 
                 end_order=i, 
                 order_dict=test_orders_dict, 
-                criterion=DEFAULT_CRITERION,
                 print_pallets=False, 
-                save_pallets=False, 
-                topx_min=1, 
-                topx_max=current_nett, 
-                topx_step=1, 
-                topx_test_without=True
+                save_pallets=False,
                 )
 
 
