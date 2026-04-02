@@ -35,13 +35,18 @@ function definition:
                 check if next box best case placement exceeds best score
                 register bounding and return
             bounding rule 4 (tall-low):
-                Check if shortest-oriented tallest remaining box in best-case placement exceeds best score
+                check if shortest-oriented tallest remaining box in best-case placement exceeds best score
                 register bounding and return
         branching case:
             find next box, its orientations, and get list of sorted extpts
             init filter 1 profile set
             check if filter 2 is relevant and store key
-            loop on orientations and extreme points:
+            create list of placement candidates
+            filter 5: (Top-X Limiting):
+                score placement list by z-height and x, y coordinates
+                filter candidate list to top X scores
+                register filtering
+            loop on candidate list:
                 check placement validity
                 # filter 4 (two-surface):
                     check if potential placement touches an edge or box on two sides
