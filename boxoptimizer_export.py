@@ -1269,6 +1269,12 @@ def run_algorithm_comparison_test(start_order=1, end_order=None, order_dict=test
     if end_order is None:
         end_order = max(order_dict.keys())
 
+    # Base final filename on whether given or test orders are tested
+    if order_dict == orders_dict:
+        prefix = "O"
+    else:
+        prefix = "T"
+
     # Get the order IDs to test between the start and end order IDs
     order_ids = [order_id for order_id in sorted(order_dict.keys()) if start_order <= order_id <= end_order]
 
@@ -1340,7 +1346,7 @@ def run_algorithm_comparison_test(start_order=1, end_order=None, order_dict=test
             print(f"    -> Finished {algo.value.upper()} | Score: {max_z} | Fulfillment: {fulfillment}% | Time: {secs_taken}s")
 
     # Export to csv
-    output_csv = f"./results/algo_comparisons/algorithm_comparison_O{start_order}_to_O{end_order}.csv"
+    output_csv = f"./results/algo_comparisons/algorithm_comparison_{prefix}{start_order}_to_{prefix}{end_order}.csv"
     results_df = pd.DataFrame(result_rows)
     results_df.to_csv(output_csv, index=False)
     
@@ -1354,19 +1360,21 @@ def run_algorithm_comparison_test(start_order=1, end_order=None, order_dict=test
 # #### Testing Area
 
 # %%
-current_order_dict = orders_dict
-current_orderID = 1
+current_order_dict = test_orders_dict
+current_orderID = 1000
 current_algo = Algorithm.BNB
 current_criterion = Criterion.VOLUME
 current_metric = Metric.MAX_Z
 current_nett = BNB_TOPX_DEFAULT_LIMIT
 testing_topx_given_orders = False
 testing_topx_test_orders = False
-testing_algo_comparisons = False
+testing_algo_comparisons = True
 
 given_order_list = []
 for i in range(40):
     given_order_list += [i+1]
+
+type_2_test_order_list = list(range(1000, 4000))
 
 topx_missing_test_orders = [2207, 2224, 2249, 2288, 2296, 2305, 2311, 2327, 2330, 2347, 2356, 2386, 2399, 2403, 2405, 2418, 2421, 2448, 2461, 2462, 2483, 2491, 2500, 2505, 2529, 2541, 2545, 2548, 2554, 2558, 2561, 2570, 2580, 2582, 2584, 2593, 2611, 2622, 2636, 2637, 2640, 2658, 2659, 2661, 2662, 2663, 2669, 2675, 2685, 2687, 2688, 2697, 2708, 2709, 2719, 2726, 2728, 2729, 2731, 2736, 2737, 2738, 2739, 2741, 2743, 2744, 2746, 2750, 2754, 2755, 2760, 2762, 2768, 2771, 2773, 2782, 2785, 2788, 2789, 2790, 2791, 2795, 2797, 2798, 2799, 2804, 2806, 2809, 2811, 2812, 2816, 2820, 2821, 2826, 2827, 2832, 2834, 2839, 2842, 2843, 2844, 2845, 2858, 2862, 2863, 2866, 2869, 2871, 2874, 2875, 2879, 2880, 2882, 2887, 2888, 2889, 2893, 2896, 2898, 2899, 2900, 2901, 2902, 2903, 2904, 2905, 2906, 2907, 2908, 2909, 2910, 2911, 2912, 2913, 2914, 2915, 2916, 2917, 2918, 2919, 2920, 2921, 2922, 2923, 2924, 2925, 2926, 2927, 2928, 2929, 2930, 2931, 2932, 2933, 2934, 2935, 2936, 2937, 2938, 2939, 2940, 2941, 2942, 2943, 2944, 2945, 2946, 2947, 2948, 2949, 2950, 2951, 2952, 2953, 2954, 2955, 2956, 2957, 2958, 2959, 2960, 2961, 2962, 2963, 2964, 2965, 2966, 2967, 2968, 2969, 2970, 2971, 2972, 2973, 2974, 2975, 2976, 2977, 2978, 2979, 2980, 2981, 2982, 2983, 2984, 2985, 2986, 2987, 2988, 2989, 2990, 2991, 2992, 2993, 2994, 2995, 2996, 2997, 2998, 2999, 3000]
 algo_missing_orders = [4, 7, 12, 20, 24, 25, 28, 31, 34, 37]
@@ -1411,15 +1419,26 @@ if __name__ == "__main__":
                     )
     elif testing_algo_comparisons:
         with concurrent.futures.ProcessPoolExecutor(max_workers=125) as executor:
-            for i in given_order_list:
-                executor.submit(
-                    run_algorithm_comparison_test, 
-                    start_order=i, 
-                    end_order=i, 
-                    order_dict=orders_dict, 
-                    print_pallets=False, 
-                    save_pallets=True,
-                    )
+            if current_order_dict == orders_dict:
+                for i in given_order_list:
+                    executor.submit(
+                        run_algorithm_comparison_test, 
+                        start_order=i,
+                        end_order=i,
+                        order_dict=current_order_dict, 
+                        print_pallets=False, 
+                        save_pallets=True,
+                        )
+            else:
+                for i in type_2_test_order_list:
+                    executor.submit(
+                        run_algorithm_comparison_test, 
+                        start_order=i,
+                        end_order=i,
+                        order_dict=current_order_dict, 
+                        print_pallets=False, 
+                        save_pallets=False,
+                        )
     else:
         print("No workload specified. Exiting...")
 
