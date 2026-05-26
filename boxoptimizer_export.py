@@ -6,10 +6,10 @@ import os
 import sys
 import time
 import math
-import concurrent
 import numpy as np
 import pandas as pd
 from enum import Enum
+import concurrent.futures
 import matplotlib.pyplot as plt
 
 NOTEBOOK_MODE = hasattr(sys, 'ps1')                                             # Detect whether diplay modules are to be loaded for notebook or terminal running (trick from https://stackoverflow.com/questions/1212779/detecting-when-a-python-script-is-being-run-interactively-in-ipython)
