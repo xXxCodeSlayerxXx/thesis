@@ -1352,7 +1352,7 @@ def run_algorithm_comparison_test(start_order=1, end_order=None, order_dict=test
 
 # %%
 current_order_dict = test_orders_dict
-current_orderID = 25
+current_orderID = 15
 current_algo = Algorithm.BNB
 current_criterion = Criterion.VOLUME
 current_metric = Metric.MAX_Z
