@@ -535,7 +535,7 @@ class Pallet:
                     f"  Branches blocked by filter:\n"
                     f"  Deduplication:            {bnb_stats['pruned_filt1']:,}",
                     f"  Symmetry breaking:        {bnb_stats['pruned_filt2']:,}",
-                    f"  Top-x candidate limiting: {bnb_stats['pruned_filt2']:,}",
+                    f"  Top-x candidate limiting: {bnb_stats['pruned_filt5']:,}",
                     "",
                     f"  Total pruned:             {total_pruned:,}",
                 ]
