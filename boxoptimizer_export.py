@@ -450,7 +450,7 @@ class Pallet:
         wasted_space = total_occupied_volume - total_box_volume
         return wasted_space
 
-    def get_pallet_results(self, algo, orderID, order_dict, print_mode=False, save_mode=False, bnb_stats=None):  # Get metrics for the pallet, optionally display them, and/or save a composite results image to ./results/
+    def get_pallet_results(self, algo, orderID, order_dict, print_mode=False, save_mode=False, bnb_stats=None, nodes=0):  # Get metrics for the pallet, optionally display them, and/or save a composite results image to ./results/
         # Get metrics
         fulfillment = self.check_order_fullfillment(orderID, order_dict)
         volume_util = self.get_volume_utilization()
@@ -458,6 +458,11 @@ class Pallet:
         cog_z = self.get_center_of_gravity_z()
         packing_score = self.get_packing_score()
         max_z = self.get_max_height()
+
+        if bnb_stats is not None:
+            nodes_evaluated = bnb_stats['nodes']
+        else:
+            nodes_evaluated = nodes 
 
         # Determine order set used
         if order_dict == orders_dict:
@@ -513,6 +518,7 @@ class Pallet:
                 f"  Dataset:                {set_name_display}",
                 f"  BnB Opt. Guarantee:     {optimal_tag}",
                 f"  BnB Candidate Limit:    {topx_limit}",
+                f"  Nodes evaluated:        {nodes_evaluated:,}",
                 "",
                 "  -- Packing Metrics ------------------",
                 f"  Max Z Height:           {max_z}        mm",
@@ -529,7 +535,6 @@ class Pallet:
                 metrics_lines += [
                     "",
                     " --- BnB Search Stats -----------------",
-                    f"  Nodes evaluated:          {bnb_stats['nodes']:,}",
                     f"  Branches pruned by rule:\n"
                     f"  Rule 1 (trivial):         {bnb_stats['pruned_rule1']:,}",
                     f"  Rule 4 (tall-low):        {bnb_stats['pruned_rule4']:,}",
@@ -682,16 +687,16 @@ def process_order(order, algo, max_attempts=DEFAULT_MAX_ATTEMPTS, criterion=DEFA
     pallet = Pallet()
 
     if algo == Algorithm.RANDOM:
-        place_box_list_random(pallet, box_list, max_attempts)
-        return pallet
+        nodes = place_box_list_random(pallet, box_list, max_attempts)
+        return pallet, nodes
 
     elif algo == Algorithm.FFD:
-        place_box_list_first_fit_decreasing(pallet, box_list, criterion=criterion)
-        return pallet
+        nodes = place_box_list_first_fit_decreasing(pallet, box_list, criterion=criterion)
+        return pallet, nodes
 
     elif algo == Algorithm.BFD:
-        place_box_list_best_fit_decreasing(pallet, box_list, criterion=criterion, opt_metric=metric)
-        return pallet
+        nodes = place_box_list_best_fit_decreasing(pallet, box_list, criterion=criterion, opt_metric=metric)
+        return pallet, nodes
 
     elif algo == Algorithm.BNB:
         bnb_stats = place_box_list_branch_and_bound(pallet, box_list, criterion=criterion, leave_tqdm=leave_tqdm, optimality_guarantee=optimality_guarantee, num_extpts_to_try=BNB_TOPX_DEFAULT_LIMIT)
@@ -778,6 +783,8 @@ def place_random_boxes(pallet, num_boxes, box_size_range):                      
         pallet.place_box((dx, dy, dz), x, y)
 
 def place_box_list_random(pallet, box_list, max_attempts):                                                                          # Place boxes from a given box list randomly on the pallet
+    nodes_traversed = 0
+    
     for boxid in box_list:
         # Get box dimensions
         dx, dy, dz, _, _ = get_box_properties_from_id(boxid)
@@ -786,6 +793,7 @@ def place_box_list_random(pallet, box_list, max_attempts):                      
         attempts = 0
 
         while not placed and attempts < max_attempts:
+            nodes_traversed += 1
             # Generate random (x, y) position for the box
             x = np.random.randint(0, pallet.size_x)
             y = np.random.randint(0, pallet.size_y)
@@ -794,9 +802,12 @@ def place_box_list_random(pallet, box_list, max_attempts):                      
             placed = pallet.place_box((dx, dy, dz), x, y)
             attempts += 1
 
+    return nodes_traversed
+
 def place_box_list_first_fit_decreasing(pallet, box_list, criterion=DEFAULT_CRITERION):                                             # Baseline (naive) algorithm: place boxes from a box list on the pallet, biggest boxes (by criterion x, y, z, a, or v) first, with lowest x (then y) values possible
     # Sort the box list by size (largest to smallest)
     sorted_box_list = sort_box_list_by_size(box_list, criterion=criterion, invert=False)
+    nodes_traversed = 0
 
     for boxid in tqdm(sorted_box_list, leave=False):
         # Get base dimensions
@@ -817,13 +828,17 @@ def place_box_list_first_fit_decreasing(pallet, box_list, criterion=DEFAULT_CRIT
             for y in cand_y:
                 if placed: break
                 for dims in orientations:
+                    nodes_traversed += 1
                     if pallet.place_box(dims, x, y):
                         placed = True
                         break
+    
+    return nodes_traversed
 
 def place_box_list_best_fit_decreasing(pallet, box_list, criterion=DEFAULT_CRITERION, opt_metric=DEFAULT_OPTIMIZATION_METRIC):      # Baseline (naive) algorithm: place boxes from a box list on the pallet, finding the best place for the boxes based on best value of optimization metric after placement
     # Sort the box list by size (largest to smallest)
     sorted_box_list = sort_box_list_by_size(box_list, criterion=criterion, invert=False)
+    nodes_traversed = 0
 
     for boxid in tqdm(sorted_box_list, desc="Placing boxes (Best Fit)", leave=False):
         # Get base dimensions
@@ -850,6 +865,8 @@ def place_box_list_best_fit_decreasing(pallet, box_list, criterion=DEFAULT_CRITE
         for dims in orientations:
             for x in cand_x:
                 for y in cand_y:
+                    nodes_traversed += 1
+
                     # Precheck conditions for place_box() before running it to save compute
                     # If prechecks pass, simulate the placement compare the resulting metric score without affecting the real pallet state
                     if pallet.check_box_placement_validity(dims, x, y):
@@ -875,6 +892,8 @@ def place_box_list_best_fit_decreasing(pallet, box_list, criterion=DEFAULT_CRITE
         else:
             print(f"Could not place box {boxid} anywhere.")
             pass
+
+    return nodes_traversed
 
 def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERION, leave_tqdm=True, optimality_guarantee=None, num_extpts_to_try=None):   # Recursive backtracking algorithm to find the optimal placement of boxes from a box list on the pallet, with pruning based on bounding functions and branching filters
     # PREWORK AND INITIALIZATIONS
@@ -1128,7 +1147,7 @@ def run_optimality_guarantee_test(start_order=1, end_order=None, order_dict=test
             leave_tqdm=False, optimality_guarantee=True
         )
         score_with_guarantee = pallet_with_guarantee.get_max_height() if metric == Metric.MAX_Z else None
-        pallet_no_guarantee.get_pallet_results(algo=Algorithm.BNB, orderID=order_id, order_dict=order_dict, print_mode=print_pallets, save_mode=save_pallets, bnb_stats=stats_with_guarantee)
+        pallet_with_guarantee.get_pallet_results(algo=Algorithm.BNB, orderID=order_id, order_dict=order_dict, print_mode=print_pallets, save_mode=save_pallets, bnb_stats=stats_with_guarantee)
 
         # Calculate differences, absolute and relative
         def calculate_row_difference(val_no_guarantee, val_with_guarantee):
@@ -1294,8 +1313,9 @@ def run_algorithm_comparison_test(start_order=1, end_order=None, order_dict=test
             # Process the order based on the algorithm type
             if algo == Algorithm.BNB:
                 pallet, bnb_stats = process_order(order_id, algo, criterion=criterion, metric=metric, order_dict=order_dict, leave_tqdm=False, optimality_guarantee=False, num_extpts_to_try=bnb_topx)
+                nodes = bnb_stats['nodes']
             else:
-                pallet = process_order(order_id, algo, max_attempts=random_attempts, criterion=criterion, metric=metric, order_dict=order_dict, leave_tqdm=False)
+                pallet, nodes = process_order(order_id, algo, max_attempts=random_attempts, criterion=criterion, metric=metric, order_dict=order_dict, leave_tqdm=False)
                 bnb_stats = None
                 
             endtime = time.time()
@@ -1310,8 +1330,8 @@ def run_algorithm_comparison_test(start_order=1, end_order=None, order_dict=test
             max_z = pallet.get_max_height()
             
             # Print and/or save the pallet visualizations
-            pallet.get_pallet_results(algo=algo, orderID=order_id, order_dict=order_dict, print_mode=print_pallets, save_mode=save_pallets, bnb_stats=bnb_stats)
-            
+            pallet.get_pallet_results(algo=algo, orderID=order_id, order_dict=order_dict, print_mode=print_pallets, save_mode=save_pallets, bnb_stats=bnb_stats, nodes=nodes)
+
             # Collate run data
             row_data = {
                 'order_id': order_id,
@@ -1323,13 +1343,13 @@ def run_algorithm_comparison_test(start_order=1, end_order=None, order_dict=test
                 'volume_util (%)': volume_util,
                 'area_usage_z0 (%)': area_usage_z0,
                 'cog_z': cog_z,
+                'nodes': nodes,
             }
             
             # Add BnB specific stats if applicable, otherwise fill with N/A
             if algo == Algorithm.BNB and bnb_stats is not None:
                 total_pruned = (bnb_stats['pruned_rule1'] + bnb_stats['pruned_rule4'] + bnb_stats['pruned_filt1'] + bnb_stats['pruned_filt2'] + bnb_stats['pruned_filt5'])
                 row_data.update({
-                    'nodes': bnb_stats['nodes'],
                     'pruned_rule1': bnb_stats['pruned_rule1'],
                     'pruned_rule4': bnb_stats['pruned_rule4'],
                     'pruned_filt1': bnb_stats['pruned_filt1'],
@@ -1339,8 +1359,12 @@ def run_algorithm_comparison_test(start_order=1, end_order=None, order_dict=test
                 })
             else:
                 row_data.update({
-                    'nodes': None, 'pruned_rule1': None, 'pruned_rule4': None,
-                    'pruned_filt1': None, 'pruned_filt2': None, 'pruned_filt5': None, 'total_pruned': None
+                    'pruned_rule1': None, 
+                    'pruned_rule4': None,
+                    'pruned_filt1': None,
+                    'pruned_filt2': None,
+                    'pruned_filt5': None,
+                    'total_pruned': None
                 })
                 
             result_rows.append(row_data)
@@ -1362,7 +1386,7 @@ def run_algorithm_comparison_test(start_order=1, end_order=None, order_dict=test
 
 # %%
 current_order_dict = test_orders_dict
-current_orderID = 1000
+current_orderID = 1
 current_algo = Algorithm.BNB
 current_criterion = Criterion.VOLUME
 current_metric = Metric.MAX_Z
@@ -1372,8 +1396,8 @@ testing_algo_comparisons = True
 
 given_order_list = list(range(1, 41))
 type_2_test_order_list = list(range(1000, 4000))
-topx_missing_test_orders = [2207, 2224, 2249, 2288, 2296, 2305, 2311, 2327, 2347, 2356, 2386, 2399, 2403, 2405, 2418, 2421, 2448, 2461, 2462, 2483, 2491, 2500, 2505, 2529, 2541, 2545, 2554, 2558, 2561, 2570, 2580, 2582, 2584, 2593, 2611, 2622, 2636, 2640, 2658, 2659, 2661, 2662, 2663, 2669, 2685, 2687, 2697, 2708, 2709, 2719, 2726, 2728, 2729, 2736, 2737, 2741, 2743, 2744, 2746, 2754, 2755, 2762, 2768, 2771, 2773, 2782, 2788, 2789, 2790, 2795, 2798, 2799, 2804, 2806, 2809, 2811, 2812, 2816, 2820, 2821, 2826, 2827, 2832, 2834, 2839, 2842, 2843, 2845, 2858, 2862, 2863, 2866, 2869, 2871, 2874, 2875, 2880, 2888, 2889, 2893, 2896, 2898, 2899, 2900, 2901, 2902, 2903, 2904, 2905, 2906, 2907, 2908, 2909, 2910, 2911, 2912, 2913, 2914, 2915, 2916, 2917, 2918, 2919, 2920, 2921, 2922, 2923, 2924, 2925, 2926, 2927, 2928, 2929, 2930, 2931, 2932, 2933, 2934, 2935, 2936, 2937, 2938, 2939, 2940, 2941, 2942, 2943, 2944, 2945, 2946, 2947, 2948, 2949, 2950, 2951, 2952, 2953, 2954, 2955, 2956, 2957, 2958, 2959, 2960, 2961, 2962, 2963, 2964, 2965, 2966, 2967, 2968, 2969, 2970, 2971, 2972, 2973, 2974, 2975, 2976, 2977, 2978, 2979, 2980, 2981, 2982, 2983, 2984, 2985, 2986, 2987, 2988, 2989, 2990, 2991, 2992, 2993, 2994, 2995, 2996, 2997, 2998, 2999]
-algo_missing_test_orders = [2947, 2958, 2960, 3035, 3076, 3080, 3104, 3122, 3155, 3171, 3175, 3176, 3181, 3204, 3208, 3213, 3219, 3220, 3239, 3244, 3249, 3271, 3277, 3281, 3283, 3285, 3293, 3307, 3319, 3329, 3334, 3340, 3347, 3348, 3364, 3366, 3369, 3378, 3389, 3394, 3397, 3399, 3407, 3420, 3430, 3435, 3443, 3447, 3455, 3457, 3463, 3467, 3477, 3479, 3480, 3483, 3484, 3486, 3495, 3497, 3499, 3503, 3506, 3516, 3518, 3519, 3523, 3533, 3537, 3553, 3557, 3559, 3573, 3574, 3577, 3597, 3599, 3603, 3606, 3609, 3610, 3613, 3614, 3615, 3619, 3621, 3622, 3623, 3625, 3628, 3630, 3633, 3636, 3637, 3639, 3640, 3641, 3645, 3647, 3653, 3654, 3655, 3656, 3657, 3659, 3661, 3664, 3665, 3666, 3670, 3672, 3673, 3674, 3677, 3680, 3682, 3684, 3685, 3686, 3687, 3688, 3690, 3691, 3692, 3693, 3694, 3695, 3696, 3697, 3698, 3699, 3700, 3701, 3702, 3703, 3704, 3705, 3706, 3707, 3708, 3709, 3710, 3711, 3712, 3713, 3714, 3715, 3716, 3717, 3718, 3719, 3720, 3721, 3722, 3723, 3724, 3725, 3726, 3727, 3728, 3729, 3730, 3731, 3732, 3733, 3734, 3735, 3736, 3737, 3738, 3739, 3740, 3741, 3742, 3743, 3744, 3745, 3746, 3747, 3748, 3749, 3750, 3751, 3752, 3753, 3754, 3755, 3756, 3757, 3758, 3759, 3760, 3761, 3762, 3763, 3764, 3765, 3766, 3767, 3768, 3769, 3770, 3771, 3772, 3773, 3774, 3775, 3776, 3777, 3778, 3779, 3780, 3781, 3782, 3783, 3784, 3785, 3786, 3787, 3788, 3789, 3790, 3791, 3792, 3793, 3794, 3795, 3796, 3797, 3798, 3799, 3800, 3801, 3802, 3803, 3804, 3805, 3806, 3807, 3808, 3809, 3810, 3811, 3812, 3813, 3814, 3815, 3816, 3817, 3818, 3819, 3820, 3821, 3822, 3823, 3824, 3825, 3826, 3827, 3828, 3829, 3830, 3831, 3832, 3833, 3834, 3835, 3836, 3837, 3838, 3839, 3840, 3841, 3842, 3843, 3844, 3845, 3846, 3847, 3848, 3849, 3850, 3851, 3852, 3853, 3854, 3855, 3856, 3857, 3858, 3859, 3860, 3861, 3862, 3863, 3864, 3865, 3866, 3867, 3868, 3869, 3870, 3871, 3872, 3873, 3874, 3875, 3876, 3877, 3878, 3879, 3880, 3881, 3882, 3883, 3884, 3885, 3886, 3887, 3888, 3889, 3890, 3891, 3892, 3893, 3894, 3895, 3896, 3897, 3898, 3899, 3900, 3901, 3902, 3903, 3904, 3905, 3906, 3907, 3908, 3909, 3910, 3911, 3912, 3913, 3914, 3915, 3916, 3917, 3918, 3919, 3920, 3921, 3922, 3923, 3924, 3925, 3926, 3927, 3928, 3929, 3930, 3931, 3932, 3933, 3934, 3935, 3936, 3937, 3938, 3939, 3940, 3941, 3942, 3943, 3944, 3945, 3946, 3947, 3948, 3949, 3950, 3951, 3952, 3953, 3954, 3955, 3956, 3957, 3958, 3959, 3960, 3961, 3962, 3963, 3964, 3965, 3966, 3967, 3968, 3969, 3970, 3971, 3972, 3973, 3974, 3975, 3976, 3977, 3978, 3979, 3980, 3981, 3982, 3983, 3984, 3985, 3986, 3987, 3988, 3989, 3990, 3991, 3992, 3993, 3994, 3995, 3996, 3997, 3998, 3999]
+topx_missing_test_orders = list(range(1000, 3000))
+algo_missing_test_orders = type_2_test_order_list
 
 random.shuffle(topx_missing_test_orders)
 random.shuffle(algo_missing_test_orders)
@@ -1384,8 +1408,8 @@ if __name__ == "__main__":
             testpallet, bnb_stats = process_order(current_orderID, algo=current_algo, criterion=current_criterion, order_dict=current_order_dict, metric=current_metric, num_extpts_to_try=current_nett)
             testpallet.get_pallet_results(current_algo, current_orderID, current_order_dict, print_mode=True, bnb_stats=bnb_stats)
         else:
-            testpallet = process_order(current_orderID, algo=current_algo, criterion=current_criterion, order_dict=current_order_dict, metric=current_metric)
-            testpallet.get_pallet_results(current_algo, current_orderID, current_order_dict, print_mode=True)
+            testpallet, nodes = process_order(current_orderID, algo=current_algo, criterion=current_criterion, order_dict=current_order_dict, metric=current_metric)
+            testpallet.get_pallet_results(current_algo, current_orderID, current_order_dict, print_mode=True, nodes=nodes)
 
     elif testing_topx_comparisons:
         with concurrent.futures.ProcessPoolExecutor(max_workers=125) as executor:
@@ -1401,7 +1425,7 @@ if __name__ == "__main__":
                         topx_min = 1,
                         topx_max= 5,
                         topx_step= 1,
-                        topx_test_without= True
+                        topx_test_without= False
                         )
             else:
                 for i in topx_missing_test_orders:
