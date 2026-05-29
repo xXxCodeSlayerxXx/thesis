@@ -1,0 +1,6 @@
+order_id,topx_limit,time_taken (min),(seconds),score,nodes,pruned_rule1,pruned_rule4,pruned_filt1,pruned_filt2,pruned_filt5,total_pruned
+23,1,0,2,0,3,0,0,0,1,60,61
+23,2,0,1,0,9,0,0,0,11,200,211
+23,3,0,2,0,46,0,0,19,76,1671,1766
+23,4,0,3,0,197,1,1,99,488,8227,8816
+23,5,18,48,460,174222,52467,9627,35418,350980,6214636,6663128

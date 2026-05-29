@@ -1,0 +1,5 @@
+order_id,algorithm,time_taken (s),score (max_z),packing_score,fulfillment (%),volume_util (%),area_usage_z0 (%),cog_z,nodes,pruned_rule1,pruned_rule4,pruned_filt1,pruned_filt2,pruned_filt5,total_pruned
+1454,RANDOM,0.0201,600,0.28,100.0,24.33,29.9,254.2,175,,,,,,
+1454,FFD,0.0159,1390,0.12,100.0,10.5,14.25,598.55,256,,,,,,
+1454,BFD,0.3063,215,0.743,100.0,67.89,75.86,97.27,1914,,,,,,
+1454,BNB,4.5109,200,0.826,100.0,72.98,85.61,86.87,794,384.0,63.0,137.0,769.0,12382.0,13735.0
