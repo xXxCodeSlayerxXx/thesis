@@ -1,0 +1,12 @@
+name: scriptie
+channels:
+  - https://conda.anaconda.org/conda-forge
+dependencies:
+  - pandas
+  - numpy
+  - tqdm
+  - ipykernel
+  - matplotlib
+  - ipywidgets
+  - pip
+prefix: /home/william/.conda/envs/scriptie
