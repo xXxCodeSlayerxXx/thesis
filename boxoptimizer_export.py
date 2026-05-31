@@ -1060,13 +1060,17 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
 # #### Testing Functions
 
 # %%
-def plot_random_performance(trials, max_max_attempts, step):                    # Plot performance of random box placement over multiple trials. Arguments: trials - amount of runs per step, max_max_attempts - maximum max_attempts value to try, step - step size between max_attempts values
-    # Final lists for plotting, max_attempts values on x axis, average fullfilment on y-axis
+def run_random_fulfillment_test(start_order=1, end_order=None, order_dict=test_orders_dict, trials=500, max_max_attempts=10000, step=10, save_result=True):
+    # Final lists for plotting, max_attempts values on x axis, average fulfillment on y-axis
     x_axis = [] 
     y_axis = []
 
-    # Number of orders to cycle through
-    number_of_orders = 40
+    # If no final order is specified, let the final order be the last entry in the dict
+    if end_order is None:
+        end_order = max(order_dict.keys())
+
+    # Get the order IDs to test between the start and end order IDs
+    order_ids = [order_id for order_id in sorted(order_dict.keys()) if start_order <= order_id <= end_order]
 
     # Use max and step size to get final range of max_attempts values (x-axis)
     max_attempts_range = range(step, max_max_attempts + 1, step)
@@ -1075,29 +1079,27 @@ def plot_random_performance(trials, max_max_attempts, step):                    
         # Keep track of scores for this max_attempts value
         scores = []
 
-        for i in trange(trials, desc=f"Running trials (max_attempts={max_attempts})...", position=1, leave=False):
-            # Pick different order every time (round robin) and get its box_list
-            order_id = (i % number_of_orders) + 1
-            box_list = get_box_list_from_order(order_id)
+        for i in range(trials):
+            # Pick random order every time and get its box_list
+            order_id = random.choice(order_ids)
+            box_list = get_box_list_from_order(order_id, order_dict)
 
-            # Initialize pallet and fill it up with the random algorithm
+            # Initialize pallet and pack it with the random algorithm
             pallet = Pallet()
             place_box_list_random(pallet, box_list, max_attempts)
 
-            # Get fulfillment score (and change from True to 100 if all boxes are accounted for)
-            score = pallet.check_order_fullfillment(order_id)
-            if score == True:
-                score = 100
+            # Get fulfillment score based on chosen order dict
+            score = pallet.check_order_fullfillment(order_id, order_dict)
             
             # Add score to scores list
-            scores += [score]
+            scores.append(score)
 
         # Average the scores for this max_attempts value
         avg_score = np.mean(scores)
 
         # Add the datapoints to the final lists
-        x_axis += [max_attempts]
-        y_axis += [avg_score]
+        x_axis.append(max_attempts)
+        y_axis.append(avg_score)
 
     # Plot the results
     plt.figure()
@@ -1107,6 +1109,10 @@ def plot_random_performance(trials, max_max_attempts, step):                    
     plt.xlabel("Maximum attempts per box")
     plt.ylabel('Average order fulfillment percentage')
     plt.ylim(0, 105)
+
+    if save_result:
+        save_path = './results/figures/random_fulfillment_test.png'
+        plt.savefig(save_path, dpi=300)
 
     plt.show()
 
@@ -1391,14 +1397,16 @@ current_algo = Algorithm.BNB
 current_criterion = Criterion.VOLUME
 current_metric = Metric.MAX_Z
 current_nett = BNB_TOPX_DEFAULT_LIMIT
-testing_topx_comparisons = True
+
+testing_random_fulfillment = True
+testing_topx_comparisons = False
 testing_algo_comparisons = False
 
 given_order_list = list(range(1, 41))
 type_2_test_order_list = list(range(1000, 4000))
 
 topx_missing_given_orders = [37]
-topx_missing_test_orders = [1833, 1848, 1912, 1934, 1950, 1974, 1981, 2007, 2016, 2021, 2028, 2054, 2058, 2061, 2107, 2122, 2124, 2128, 2136, 2143, 2149, 2169, 2172, 2176, 2183, 2189, 2196, 2198, 2199, 2204, 2207, 2208, 2211, 2219, 2224, 2237, 2240, 2244, 2249, 2253, 2255, 2256, 2257, 2258, 2259, 2262, 2271, 2273, 2274, 2281, 2283, 2288, 2289, 2295, 2296, 2297, 2305, 2311, 2320, 2326, 2327, 2329, 2332, 2339, 2340, 2345, 2346, 2347, 2350, 2351, 2352, 2354, 2356, 2365, 2374, 2375, 2376, 2381, 2383, 2386, 2393, 2399, 2400, 2402, 2403, 2405, 2411, 2415, 2416, 2417, 2418, 2421, 2424, 2425, 2433, 2434, 2435, 2436, 2439, 2440, 2445, 2448, 2455, 2456, 2457, 2460, 2461, 2462, 2463, 2465, 2469, 2470, 2473, 2476, 2477, 2490, 2491, 2494, 2497, 2498, 2499, 2502, 2505, 2506, 2507, 2513, 2514, 2517, 2520, 2521, 2523, 2524, 2526, 2527, 2530, 2531, 2533, 2535, 2536, 2539, 2541, 2544, 2547, 2548, 2549, 2552, 2554, 2555, 2556, 2557, 2558, 2560, 2561, 2562, 2563, 2564, 2566, 2568, 2570, 2572, 2574, 2577, 2579, 2582, 2584, 2588, 2589, 2591, 2593, 2594, 2596, 2598, 2599, 2600, 2601, 2602, 2604, 2608, 2609, 2610, 2611, 2612, 2614, 2615, 2617, 2618, 2622, 2625, 2626, 2629, 2630, 2634, 2636, 2637, 2638, 2640, 2641, 2642, 2646, 2647, 2651, 2655, 2657, 2658, 2659, 2661, 2662, 2663, 2667, 2669, 2670, 2674, 2675, 2682, 2683, 2685, 2686, 2687, 2688, 2690, 2691, 2693, 2696, 2697, 2698, 2700, 2707, 2708, 2709, 2712, 2714, 2716, 2717, 2718, 2719, 2720, 2721, 2723, 2726, 2728, 2729, 2731, 2733, 2734, 2735, 2736, 2737, 2738, 2739, 2741, 2742, 2743, 2744, 2746, 2750, 2752, 2753, 2754, 2755, 2756, 2758, 2760, 2761, 2762, 2763, 2764, 2767, 2768, 2769, 2771, 2772, 2773, 2775, 2781, 2782, 2785, 2786, 2788, 2789, 2790, 2791, 2795, 2798, 2799, 2800, 2801, 2803, 2804, 2806, 2809, 2810, 2811, 2812, 2816, 2819, 2820, 2821, 2822, 2823, 2826, 2827, 2829, 2830, 2831, 2832, 2833, 2834, 2835, 2836, 2837, 2839, 2840, 2841, 2842, 2843, 2844, 2845, 2846, 2850, 2853, 2855, 2856, 2857, 2858, 2859, 2860, 2862, 2863, 2864, 2866, 2867, 2868, 2869, 2871, 2874, 2875, 2876, 2880, 2881, 2885, 2886, 2888, 2889, 2890, 2891, 2893, 2894, 2895, 2896, 2897, 2898, 2899, 2900, 2901, 2902, 2903, 2904, 2905, 2906, 2907, 2908, 2909, 2910, 2911, 2912, 2914, 2915, 2917, 2919, 2920, 2921, 2922, 2923, 2926, 2927, 2929, 2930, 2931, 2933, 2934, 2935, 2938, 2939, 2940, 2943, 2945, 2946, 2947, 2949, 2951, 2952, 2953, 2954, 2955, 2957, 2958, 2959, 2960, 2961, 2962, 2963, 2965, 2966, 2967, 2970, 2971, 2972, 2973, 2974, 2975, 2977, 2979, 2980, 2981, 2982, 2983, 2986, 2987, 2988, 2989, 2990, 2991, 2993, 2994, 2995, 2996, 2997, 2999]
+topx_missing_test_orders = [1950, 2016, 2054, 2058, 2122, 2124, 2128, 2143, 2176, 2183, 2189, 2196, 2199, 2204, 2207, 2208, 2211, 2224, 2240, 2249, 2253, 2256, 2257, 2259, 2262, 2274, 2283, 2288, 2289, 2295, 2296, 2297, 2305, 2311, 2326, 2327, 2329, 2345, 2347, 2350, 2351, 2354, 2356, 2383, 2386, 2393, 2399, 2400, 2402, 2403, 2405, 2411, 2415, 2416, 2417, 2418, 2421, 2424, 2425, 2435, 2436, 2439, 2440, 2445, 2448, 2455, 2461, 2462, 2463, 2465, 2470, 2476, 2490, 2491, 2494, 2497, 2498, 2499, 2505, 2507, 2513, 2514, 2520, 2521, 2523, 2526, 2527, 2533, 2535, 2539, 2541, 2544, 2548, 2549, 2552, 2554, 2558, 2561, 2562, 2563, 2566, 2570, 2574, 2577, 2582, 2584, 2591, 2593, 2594, 2596, 2598, 2600, 2601, 2602, 2604, 2608, 2609, 2610, 2611, 2612, 2614, 2615, 2617, 2618, 2622, 2625, 2626, 2629, 2630, 2634, 2636, 2637, 2638, 2640, 2641, 2642, 2646, 2647, 2651, 2655, 2657, 2658, 2659, 2661, 2662, 2663, 2667, 2669, 2670, 2674, 2675, 2682, 2683, 2685, 2686, 2687, 2688, 2690, 2691, 2693, 2696, 2697, 2698, 2700, 2707, 2708, 2709, 2712, 2714, 2716, 2717, 2718, 2719, 2720, 2721, 2723, 2726, 2728, 2729, 2731, 2733, 2734, 2735, 2736, 2737, 2738, 2739, 2741, 2742, 2743, 2744, 2746, 2750, 2752, 2753, 2754, 2755, 2756, 2758, 2760, 2761, 2762, 2763, 2764, 2767, 2768, 2769, 2771, 2772, 2773, 2775, 2781, 2782, 2785, 2786, 2788, 2789, 2790, 2791, 2795, 2798, 2799, 2800, 2801, 2803, 2804, 2806, 2809, 2810, 2811, 2812, 2816, 2819, 2820, 2821, 2822, 2823, 2826, 2827, 2829, 2830, 2831, 2832, 2833, 2834, 2835, 2836, 2837, 2839, 2842, 2843, 2844, 2845, 2846, 2853, 2855, 2856, 2857, 2858, 2860, 2862, 2863, 2864, 2866, 2868, 2869, 2871, 2874, 2875, 2876, 2880, 2881, 2885, 2886, 2888, 2889, 2893, 2894, 2896, 2897, 2898, 2899, 2900, 2901, 2903, 2904, 2905, 2906, 2907, 2908, 2909, 2910, 2911, 2912, 2914, 2915, 2917, 2919, 2920, 2921, 2922, 2923, 2926, 2927, 2929, 2930, 2931, 2933, 2934, 2935, 2938, 2939, 2940, 2943, 2945, 2946, 2947, 2949, 2951, 2952, 2953, 2954, 2955, 2957, 2958, 2959, 2960, 2962, 2963, 2965, 2966, 2967, 2970, 2971, 2972, 2973, 2974, 2975, 2979, 2980, 2981, 2982, 2983, 2986, 2987, 2988, 2989, 2990, 2991, 2993, 2994, 2995, 2996, 2997, 2999]
 
 algo_missing_given_orders = [37]
 algo_missing_test_orders = [3625, 3680, 3738, 3871, 3911, 3922, 3959, 3967]
@@ -1414,6 +1422,9 @@ if __name__ == "__main__":
         else:
             testpallet, nodes = process_order(current_orderID, algo=current_algo, criterion=current_criterion, order_dict=current_order_dict, metric=current_metric)
             testpallet.get_pallet_results(current_algo, current_orderID, current_order_dict, print_mode=True, nodes=nodes)
+
+    elif testing_random_fulfillment:
+        run_random_fulfillment_test(1000, 3999, test_orders_dict, 500, 40000, 10, True)
 
     elif testing_topx_comparisons:
         with concurrent.futures.ProcessPoolExecutor(max_workers=125) as executor:
