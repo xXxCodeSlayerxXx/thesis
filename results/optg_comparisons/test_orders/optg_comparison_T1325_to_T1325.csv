@@ -1,0 +1,2 @@
+order_id,score_no_guarantee,score_with_guarantee,nodes_no_guarantee,nodes_with_guarantee,nodes_diff_abs,nodes_diff_factor,r1_no_guarantee,r1_with_guarantee,r1_diff_abs,r1_diff_factor,r4_no_guarantee,r4_with_guarantee,r4_diff_abs,r4_diff_factor,filt1_no_guarantee,filt1_with_guarantee,filt1_diff_abs,filt1_diff_factor,filt2_no_guarantee,filt2_with_guarantee,filt2_diff_abs,filt2_diff_factor,filt5_no_guarantee,filt5_with_guarantee,filt5_diff_abs,filt5_diff_factor
+1325,310,310,319,1088,769,0.2932,219,868,649,0.2523,12,18,6,0.6667,640,0,640,N/A,709,1696,987,0.418,709,1696,0,N/A
