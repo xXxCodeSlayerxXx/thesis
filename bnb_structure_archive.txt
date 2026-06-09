@@ -233,7 +233,7 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
                 count_filt2 += 1
                 continue
 
-            delta = pallet.place_box(dims, x, y)                                                    # Place box if branch not filtered
+            delta = pallet.place_box(dims, x, y)                                                            # Place box if branch not filtered
             if not delta:
                 continue
 
