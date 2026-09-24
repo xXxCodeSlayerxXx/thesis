@@ -22,7 +22,7 @@ else:
     from tqdm import tqdm, trange
 
 # %% [markdown]
-# #### Enum Instantiation & Categorization
+# #### Instantiations & Categorizations
 
 # %%
 class Criterion(Enum):                                                          # Enum for box sorting criterion options
@@ -45,6 +45,8 @@ class Algorithm(Enum):                                                          
     BFD = "bfd"
     BNB = "bnb"
 
+_BNB_MC_STATE = None                                                            # Instantiate state for multicore branch and bound
+
 MAXIMIZE_METRICS = [Metric.PACKING_SCORE, Metric.VOLUME_UTILIZATION]            # Define which metrics should be maximized vs minimized (higher is better vs lower is better)
 MINIMIZE_METRICS = [Metric.COG_Z, Metric.MAX_Z]
 
@@ -52,6 +54,7 @@ MINIMIZE_METRICS = [Metric.COG_Z, Metric.MAX_Z]
 # #### Global Settings
 
 # %%
+DEFAULT_MP_CORES                = max(2, os.cpu_count())                        # Default number of cores to use for multiprocessing tasks
 PALLET_DIMS                     = (1000, 1400, 1400)                            # Length, width, height (X, Y, Z, respectively) in mm
 DEFAULT_CRITERION               = Criterion.VOLUME                              # Default criterion for box sorting
 DEFAULT_OPTIMIZATION_METRIC     = Metric.MAX_Z                                  # Default score to optimize best fit algorithms for
@@ -764,6 +767,142 @@ def calculate_cumulative_volume_dicts(box_list):                                
         
     return cumulative_volume_dict, volume_to_go_dict
 
+def _bnb_mc_init_worker(base_pallet, sorted_box_list, use_guarantee,
+                        num_extpts_to_try, box_orientations_dict,
+                        tallest_remaining_orientations, dimension_tuples,
+                        initial_best_score):
+    global _BNB_MC_STATE
+    _BNB_MC_STATE = (
+        base_pallet,
+        sorted_box_list,
+        use_guarantee,
+        num_extpts_to_try,
+        box_orientations_dict,
+        tallest_remaining_orientations,
+        dimension_tuples,
+        initial_best_score,
+    )
+
+def _bnb_mc_search_root(task):
+    """Search one root branch. Must remain at module scope for multiprocessing."""
+    root_index, root_placement = task
+    (base_pallet, sorted_box_list, use_guarantee, num_extpts_to_try,
+     box_orientations_dict, tallest_remaining_orientations, dimension_tuples,
+     initial_best_score) = _BNB_MC_STATE
+
+    # A process receives its own pickled base pallet. Mutating it is safe, but a
+    # worker can execute several tasks, so restore it after every root subtree.
+    pallet = base_pallet
+    dims, x, y = root_placement
+    root_delta = pallet.place_box(dims, x, y)
+    if not root_delta:
+        return root_index, None, initial_best_score, {
+            'nodes': 0, 'pruned_rule1': 0, 'pruned_rule4': 0,
+            'pruned_filt1': 0, 'pruned_filt2': 0, 'pruned_filt5': 0,
+        }
+
+    current_sequence = [root_placement]
+    best_sequence = None
+    best_score = initial_best_score
+    counts = {
+        'nodes': 0, 'pruned_rule1': 0, 'pruned_rule4': 0,
+        'pruned_filt1': 0, 'pruned_filt2': 0, 'pruned_filt5': 0,
+    }
+
+    def recursive_place(box_index):
+        nonlocal best_score, best_sequence
+
+        if box_index == len(sorted_box_list):
+            current_score = pallet.get_max_height()
+            if current_score < best_score:
+                best_score = current_score
+                best_sequence = list(current_sequence)
+            return
+
+        if pallet.get_max_height() >= best_score:
+            counts['pruned_rule1'] += 1
+            return
+
+        t_orientations = tallest_remaining_orientations[box_index]
+        min_landing_z = PALLET_DIMS[2] + 100
+        for cx, cy in pallet.extpts:
+            for candidate_dims in t_orientations:
+                if pallet.check_box_placement_validity(candidate_dims, cx, cy):
+                    landing_z = pallet.get_max_height_in_area(
+                        cx, cy, candidate_dims[0], candidate_dims[1]
+                    )
+                    min_landing_z = min(
+                        min_landing_z, landing_z + candidate_dims[2]
+                    )
+
+        if PALLET_DIMS[2] + 100 > min_landing_z >= best_score:
+            counts['pruned_rule4'] += 1
+            return
+
+        boxid = sorted_box_list[box_index]
+        orientations = box_orientations_dict[boxid]
+        sorted_extpts = sorted(pallet.extpts)
+        seen_profile_keys = set() if not use_guarantee else None
+
+        if dimension_tuples[box_index] == dimension_tuples[box_index - 1]:
+            filt2_key = current_sequence[-1]
+        else:
+            filt2_key = None
+
+        candidate_placements = []
+        for candidate_dims in orientations:
+            for cx, cy in sorted_extpts:
+                if pallet.check_box_placement_validity(candidate_dims, cx, cy):
+                    landing_z = pallet.get_max_height_in_area(
+                        cx, cy, candidate_dims[0], candidate_dims[1]
+                    )
+                    top_z = landing_z + candidate_dims[2]
+                    score = (top_z, cx + cy)
+                    candidate_placements.append(
+                        (score, candidate_dims, cx, cy)
+                    )
+
+        if not use_guarantee and num_extpts_to_try is not None:
+            candidate_placements.sort(key=lambda c: c[0])
+            filtered = max(
+                0, len(candidate_placements) - num_extpts_to_try
+            )
+            candidate_placements = candidate_placements[:num_extpts_to_try]
+            counts['pruned_filt5'] += filtered
+
+        for _, candidate_dims, cx, cy in candidate_placements:
+            if not use_guarantee:
+                z = pallet.get_max_height_in_area(
+                    cx, cy, candidate_dims[0], candidate_dims[1]
+                )
+                profile_key = (candidate_dims, z)
+                if profile_key in seen_profile_keys:
+                    counts['pruned_filt1'] += 1
+                    continue
+
+            if filt2_key is not None and filt2_key > (candidate_dims, cx, cy):
+                counts['pruned_filt2'] += 1
+                continue
+
+            delta = pallet.place_box(candidate_dims, cx, cy)
+            if not delta:
+                continue
+
+            if not use_guarantee:
+                seen_profile_keys.add(profile_key)
+
+            current_sequence.append((candidate_dims, cx, cy))
+            counts['nodes'] += 1
+            recursive_place(box_index + 1)
+            current_sequence.pop()
+            pallet.remove_box(delta)
+
+    try:
+        recursive_place(1)
+        return root_index, best_sequence, best_score, counts
+    finally:
+        pallet.remove_box(root_delta)
+
 # %% [markdown]
 # #### Box Placing Algorithms
 
@@ -1057,6 +1196,173 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
     }
     return bnb_stats
 
+def place_box_list_branch_and_bound_mc(pallet, box_list, criterion=DEFAULT_CRITERION, leave_tqdm=True, optimality_guarantee=None, num_extpts_to_try=None, cores=1):
+    """Multi-core variant of place_box_list_branch_and_bound.
+
+    The root branches are searched in separate processes. All bounding rules,
+    filters, candidate scoring, top-X limiting, and depth-first order inside a
+    root subtree are identical to the single-core implementation. Results are
+    reduced in original root-branch order, preserving deterministic tie choice.
+    """
+    if not isinstance(cores, int) or isinstance(cores, bool) or cores < 1:
+        raise ValueError("cores must be a positive integer")
+
+    # This is also the exact fallback for empty/single-branch cases.
+    if cores == 1 or not box_list:
+        return place_box_list_branch_and_bound(
+            pallet, box_list, criterion=criterion, leave_tqdm=leave_tqdm,
+            optimality_guarantee=optimality_guarantee,
+            num_extpts_to_try=num_extpts_to_try,
+        )
+
+    sorted_box_list = sort_box_list_by_size(
+        box_list, criterion=criterion, invert=False
+    )
+    use_guarantee = (
+        BNB_OPTIMALITY_GUARANTEE
+        if optimality_guarantee is None else optimality_guarantee
+    )
+
+    temp_pallet = Pallet()
+    place_box_list_best_fit_decreasing(
+        temp_pallet, sorted_box_list, criterion=criterion
+    )
+    initial_best_score = temp_pallet.get_max_height() + 1
+
+    box_orientations_dict = {}
+    for boxid in set(sorted_box_list):
+        dx, dy, dz, _, _ = get_box_properties_from_id(boxid)
+        box_orientations_dict[boxid] = get_box_orientations(dx, dy, dz)
+
+    tallest_remaining_orientations = []
+    for i in range(len(sorted_box_list)):
+        tallest_remaining_id = max(
+            sorted_box_list[i:],
+            key=lambda bid: min(get_box_properties_from_id(bid)[:3])
+        )
+        tallest_remaining_orientations.append(
+            box_orientations_dict[tallest_remaining_id]
+        )
+
+    dimension_tuples = [
+        tuple(sorted(get_box_properties_from_id(boxid)[:3]))
+        for boxid in sorted_box_list
+    ]
+
+    # Generate and filter the root branches exactly once, in exactly the same
+    # order as the single-core routine. The workers start at depth 1.
+    boxid = sorted_box_list[0]
+    orientations = box_orientations_dict[boxid]
+    sorted_extpts = sorted(pallet.extpts)
+    candidate_placements = []
+    for dims in orientations:
+        for x, y in sorted_extpts:
+            if pallet.check_box_placement_validity(dims, x, y):
+                landing_z = pallet.get_max_height_in_area(
+                    x, y, dims[0], dims[1]
+                )
+                candidate_placements.append(
+                    ((landing_z + dims[2], x + y), dims, x, y)
+                )
+
+    root_filt5 = 0
+    if not use_guarantee and num_extpts_to_try is not None:
+        candidate_placements.sort(key=lambda c: c[0])
+        root_filt5 = max(
+            0, len(candidate_placements) - num_extpts_to_try
+        )
+        candidate_placements = candidate_placements[:num_extpts_to_try]
+
+    root_filt1 = 0
+    root_filt2 = 0
+    root_tasks = []
+    seen_profile_keys = set() if not use_guarantee else None
+
+    # Match the original symmetry test. At depth zero no predecessor placement
+    # normally exists, so only activate it when there really is one.
+    filt2_key = None
+
+    for _, dims, x, y in candidate_placements:
+        if not use_guarantee:
+            z = pallet.get_max_height_in_area(x, y, dims[0], dims[1])
+            profile_key = (dims, z)
+            if profile_key in seen_profile_keys:
+                root_filt1 += 1
+                continue
+
+        if filt2_key is not None and filt2_key > (dims, x, y):
+            root_filt2 += 1
+            continue
+
+        # Confirm place_box accepts the branch, exactly as the serial routine
+        # does before counting and recursing, then immediately undo it.
+        delta = pallet.place_box(dims, x, y)
+        if not delta:
+            continue
+        pallet.remove_box(delta)
+
+        if not use_guarantee:
+            seen_profile_keys.add(profile_key)
+        root_tasks.append((len(root_tasks), (dims, x, y)))
+
+    if len(root_tasks) <= 1:
+        return place_box_list_branch_and_bound(
+            pallet, box_list, criterion=criterion, leave_tqdm=leave_tqdm,
+            optimality_guarantee=optimality_guarantee,
+            num_extpts_to_try=num_extpts_to_try,
+        )
+
+    worker_count = min(cores, len(root_tasks))
+    initializer_args = (
+        pallet, sorted_box_list, use_guarantee, num_extpts_to_try,
+        box_orientations_dict, tallest_remaining_orientations,
+        dimension_tuples, initial_best_score,
+    )
+
+    with concurrent.futures.ProcessPoolExecutor(
+            max_workers=worker_count,
+            initializer=_bnb_mc_init_worker,
+            initargs=initializer_args) as executor:
+        results = list(executor.map(_bnb_mc_search_root, root_tasks))
+
+    # executor.map retains task order. Sorting explicitly documents and protects
+    # the serial DFS tie behavior if the execution strategy is changed later.
+    results.sort(key=lambda result: result[0])
+    best_score = initial_best_score
+    best_sequence = None
+    totals = {
+        'nodes': len(root_tasks),
+        'pruned_rule1': 0,
+        'pruned_rule4': 0,
+        'pruned_filt1': root_filt1,
+        'pruned_filt2': root_filt2,
+        'pruned_filt5': root_filt5,
+    }
+
+    for _, sequence, score, counts in results:
+        for key in totals:
+            totals[key] += counts[key]
+        if sequence is not None and score < best_score:
+            best_score = score
+            best_sequence = sequence
+
+    if best_sequence:
+        for dims, x, y in best_sequence:
+            pallet.place_box(dims, x, y)
+    else:
+        print("Branch and Bound failed. No valid placements found.")
+
+    return {
+        'nodes': totals['nodes'],
+        'pruned_rule1': totals['pruned_rule1'],
+        'pruned_rule4': totals['pruned_rule4'],
+        'pruned_filt1': totals['pruned_filt1'],
+        'pruned_filt2': totals['pruned_filt2'],
+        'pruned_filt5': totals['pruned_filt5'],
+        'best_score': best_score,
+        'optimality_guarantee': use_guarantee,
+        'topx_limit': num_extpts_to_try,
+    }
 
 # %% [markdown]
 # #### Testing Functions
@@ -1401,6 +1707,239 @@ def run_algorithm_comparison_test(start_order=1, end_order=None, order_dict=test
     
     return results_df
 
+def run_bnb_mc_speed_comparison(mp_core_min=2, mp_core_max=DEFAULT_MP_CORES, mp_core_step=2, start_order=1, end_order=None, order_dict=test_orders_dict, criterion=DEFAULT_CRITERION, metric=Metric.MAX_Z, print_pallets=True, save_pallets=False, bnb_topx=BNB_TOPX_DEFAULT_LIMIT):
+    """Compare serial and multi-core BnB runtimes and verify identical pallets.
+
+    One serial baseline is run per order, followed by one multi-core run for
+    every requested core count. The CSV contains one row per implementation,
+    order, and core count. Multi-core pallets are compared against the serial
+    pallet using their canonical box placements, heightmap, and maximum height.
+    """
+    if not isinstance(mp_core_min, int) or isinstance(mp_core_min, bool) or mp_core_min < 1:
+        raise ValueError("mp_core_min must be a positive integer")
+    if not isinstance(mp_core_max, int) or isinstance(mp_core_max, bool) or mp_core_max < mp_core_min:
+        raise ValueError("mp_core_max must be an integer greater than or equal to mp_core_min")
+    if not isinstance(mp_core_step, int) or isinstance(mp_core_step, bool) or mp_core_step < 1:
+        raise ValueError("mp_core_step must be a positive integer")
+
+    if end_order is None:
+        end_order = max(order_dict.keys())
+
+    if order_dict == orders_dict:
+        prefix = "O"
+    else:
+        prefix = "T"
+
+    order_ids = [
+        order_id for order_id in sorted(order_dict.keys())
+        if start_order <= order_id <= end_order
+    ]
+    if not order_ids:
+        raise ValueError(
+            f"No orders found from {start_order} through {end_order} in order_dict"
+        )
+
+    core_counts = list(range(mp_core_min, mp_core_max + 1, mp_core_step))
+    result_rows = []
+
+    def canonical_boxes(pallet_to_compare):
+        return sorted(
+            (
+                box['x'], box['y'], box['z'],
+                box['dx'], box['dy'], box['dz']
+            )
+            for box in pallet_to_compare.boxes
+        )
+
+    def metric_value(pallet_to_measure):
+        if metric == Metric.MAX_Z:
+            return pallet_to_measure.get_max_height()
+        if metric == Metric.PACKING_SCORE:
+            return pallet_to_measure.get_packing_score()
+        if metric == Metric.VOLUME_UTILIZATION:
+            return pallet_to_measure.get_volume_utilization()
+        if metric == Metric.COG_Z:
+            return pallet_to_measure.get_center_of_gravity_z()
+        if metric == Metric.ALL:
+            return None
+        raise ValueError(f"Unsupported metric: {metric}")
+
+    for order_id in tqdm(order_ids, desc="Testing orders", unit=" orders"):
+        print("\n" + "-" * 124)
+        print("-" * 124)
+        print(f"Running serial baseline for order {prefix}{order_id}...")
+
+        box_list = get_box_list_from_order(order_id, order_dict)
+        serial_pallet = Pallet()
+
+        serial_start = time.perf_counter()
+        serial_stats = place_box_list_branch_and_bound(
+            serial_pallet,
+            box_list,
+            criterion=criterion,
+            leave_tqdm=False,
+            optimality_guarantee=False,
+            num_extpts_to_try=bnb_topx,
+        )
+        serial_seconds = time.perf_counter() - serial_start
+        serial_metric = metric_value(serial_pallet)
+        serial_boxes = canonical_boxes(serial_pallet)
+
+        serial_pallet.get_pallet_results(
+            algo=Algorithm.BNB,
+            orderID=order_id,
+            order_dict=order_dict,
+            print_mode=print_pallets,
+            save_mode=save_pallets,
+            bnb_stats=serial_stats,
+        )
+
+        result_rows.append({
+            'order_id': order_id,
+            'order_label': f"{prefix}{order_id}",
+            'implementation': 'single_core',
+            'cores': 1,
+            'seconds': serial_seconds,
+            'speedup_vs_single_core': 1.0,
+            'metric': metric.value,
+            'metric_value': serial_metric,
+            'max_z': serial_pallet.get_max_height(),
+            'box_count': len(serial_pallet.boxes),
+            'nodes': serial_stats['nodes'],
+            'pruned_rule1': serial_stats['pruned_rule1'],
+            'pruned_rule4': serial_stats['pruned_rule4'],
+            'pruned_filt1': serial_stats['pruned_filt1'],
+            'pruned_filt2': serial_stats['pruned_filt2'],
+            'pruned_filt5': serial_stats['pruned_filt5'],
+            'matches_single_core': True,
+            'boxes_match': True,
+            'heightmap_match': True,
+            'max_z_match': True,
+        })
+        print(
+            f"Serial finished | {serial_seconds:.6f}s | "
+            f"max_z={serial_pallet.get_max_height()} | nodes={serial_stats['nodes']}"
+        )
+
+        for cores in core_counts:
+            print(f"\nRunning order {prefix}{order_id} with {cores} processes...")
+            mc_pallet = Pallet()
+
+            mc_start = time.perf_counter()
+            mc_stats = place_box_list_branch_and_bound_mc(
+                mc_pallet,
+                box_list,
+                criterion=criterion,
+                leave_tqdm=False,
+                optimality_guarantee=False,
+                num_extpts_to_try=bnb_topx,
+                cores=cores,
+            )
+            mc_seconds = time.perf_counter() - mc_start
+            mc_metric = metric_value(mc_pallet)
+
+            boxes_match = canonical_boxes(mc_pallet) == serial_boxes
+            heightmap_match = np.array_equal(
+                mc_pallet.heightmap, serial_pallet.heightmap
+            )
+            max_z_match = (
+                mc_pallet.get_max_height() == serial_pallet.get_max_height()
+            )
+            pallets_match = boxes_match and heightmap_match and max_z_match
+            speedup = serial_seconds / mc_seconds if mc_seconds > 0 else math.inf
+
+            if not pallets_match:
+                serial_box_set = set(serial_boxes)
+                mc_box_set = set(canonical_boxes(mc_pallet))
+                only_serial = sorted(serial_box_set - mc_box_set)
+                only_mc = sorted(mc_box_set - serial_box_set)
+                differing_cells = int(np.count_nonzero(
+                    mc_pallet.heightmap != serial_pallet.heightmap
+                ))
+                max_heightmap_delta = int(np.max(np.abs(
+                    mc_pallet.heightmap.astype(np.int64)
+                    - serial_pallet.heightmap.astype(np.int64)
+                )))
+
+                print("\n*** PALLET MISMATCH DETECTED ***")
+                print(f"Order: {prefix}{order_id}")
+                print(f"Multi-core process count: {cores}")
+                print(f"Boxes match: {boxes_match}")
+                print(f"Heightmaps match: {heightmap_match}")
+                print(f"Maximum heights match: {max_z_match}")
+                print(
+                    f"Serial max_z={serial_pallet.get_max_height()}, "
+                    f"multi-core max_z={mc_pallet.get_max_height()}"
+                )
+                print(
+                    f"Serial metric={serial_metric}, "
+                    f"multi-core metric={mc_metric}"
+                )
+                print(
+                    f"Serial boxes={len(serial_pallet.boxes)}, "
+                    f"multi-core boxes={len(mc_pallet.boxes)}"
+                )
+                print(f"Differing heightmap cells: {differing_cells}")
+                print(f"Maximum absolute heightmap delta: {max_heightmap_delta}")
+                print(f"Placements only in serial, first 10: {only_serial[:10]}")
+                print(f"Placements only in multi-core, first 10: {only_mc[:10]}")
+                print(f"Serial stats: {serial_stats}")
+                print(f"Multi-core stats: {mc_stats}")
+
+            mc_pallet.get_pallet_results(
+                algo=Algorithm.BNB,
+                orderID=order_id,
+                order_dict=order_dict,
+                print_mode=print_pallets,
+                save_mode=save_pallets,
+                bnb_stats=mc_stats,
+            )
+
+            result_rows.append({
+                'order_id': order_id,
+                'order_label': f"{prefix}{order_id}",
+                'implementation': 'multi_core',
+                'cores': cores,
+                'seconds': mc_seconds,
+                'speedup_vs_single_core': speedup,
+                'metric': metric.value,
+                'metric_value': mc_metric,
+                'max_z': mc_pallet.get_max_height(),
+                'box_count': len(mc_pallet.boxes),
+                'nodes': mc_stats['nodes'],
+                'pruned_rule1': mc_stats['pruned_rule1'],
+                'pruned_rule4': mc_stats['pruned_rule4'],
+                'pruned_filt1': mc_stats['pruned_filt1'],
+                'pruned_filt2': mc_stats['pruned_filt2'],
+                'pruned_filt5': mc_stats['pruned_filt5'],
+                'matches_single_core': pallets_match,
+                'boxes_match': boxes_match,
+                'heightmap_match': heightmap_match,
+                'max_z_match': max_z_match,
+            })
+            print(
+                f"MP{cores} finished | {mc_seconds:.6f}s | "
+                f"speedup={speedup:.3f}x | match={pallets_match}"
+            )
+
+    output_dir = "./results/speed_comparisons"
+    os.makedirs(output_dir, exist_ok=True)
+    output_csv = (
+        f"{output_dir}/speed_comparison_"
+        f"{prefix}{start_order}_to_{prefix}{end_order}_"
+        f"MP{mp_core_min}-{mp_core_max}-{mp_core_step}.csv"
+    )
+    results_df = pd.DataFrame(result_rows)
+    results_df.to_csv(output_csv, index=False)
+
+    mismatch_count = int((~results_df['matches_single_core']).sum())
+    print("\n" + "-" * 124)
+    print("-" * 124)
+    print(f"Testing complete! Results saved to: {output_csv}")
+    print(f"Detected multi-core pallet mismatches: {mismatch_count}")
+    return results_df
+
+
 # %% [markdown]
 # #### Testing Area
 
@@ -1416,6 +1955,7 @@ testing_random_fulfillment = False
 testing_optg_comparisons = False
 testing_topx_comparisons = False
 testing_algo_comparisons = False
+testing_speed_comparison = True
 
 given_order_list = list(range(1, 41))
 type_2_test_order_list = list(range(1000, 4000))
@@ -1429,7 +1969,9 @@ algo_missing_test_orders = [3871, 3922, 3959]
 
 if __name__ == "__main__":
     if NOTEBOOK_MODE:
-        if current_algo == Algorithm.BNB:
+        if testing_speed_comparison:
+            run_bnb_mc_speed_comparison(2, 8, 2, 10, 25, test_orders_dict)
+        elif current_algo == Algorithm.BNB:
             testpallet, bnb_stats = process_order(current_orderID, algo=current_algo, criterion=current_criterion, order_dict=current_order_dict, metric=current_metric, num_extpts_to_try=current_nett)
             testpallet.get_pallet_results(current_algo, current_orderID, current_order_dict, print_mode=True, bnb_stats=bnb_stats)
         else:
