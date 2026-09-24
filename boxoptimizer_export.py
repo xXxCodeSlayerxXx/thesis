@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 from enum import Enum
 import concurrent.futures
+import multiprocessing as mp
 import matplotlib.pyplot as plt
 
 NOTEBOOK_MODE = hasattr(sys, 'ps1')                                             # Detect whether diplay modules are to be loaded for notebook or terminal running (trick from https://stackoverflow.com/questions/1212779/detecting-when-a-python-script-is-being-run-interactively-in-ipython)
@@ -54,7 +55,7 @@ MINIMIZE_METRICS = [Metric.COG_Z, Metric.MAX_Z]
 # #### Global Settings
 
 # %%
-DEFAULT_MP_CORES                = max(2, os.cpu_count())                        # Default number of cores to use for multiprocessing tasks
+DEFAULT_MP_CORES                = max(2, os.cpu_count() or 2)                   # Default number of cores to use for multiprocessing tasks
 PALLET_DIMS                     = (1000, 1400, 1400)                            # Length, width, height (X, Y, Z, respectively) in mm
 DEFAULT_CRITERION               = Criterion.VOLUME                              # Default criterion for box sorting
 DEFAULT_OPTIMIZATION_METRIC     = Metric.MAX_Z                                  # Default score to optimize best fit algorithms for
@@ -685,7 +686,7 @@ def sort_box_list_by_size(box_list, criterion=DEFAULT_CRITERION, invert=False): 
     
     return sorted_list
     
-def process_order(order, algo, max_attempts=DEFAULT_MAX_ATTEMPTS, criterion=DEFAULT_CRITERION, metric=DEFAULT_OPTIMIZATION_METRIC, order_dict=orders_dict, leave_tqdm=True, optimality_guarantee=None, num_extpts_to_try=None):     # Process a given order using the specified algorithm, max attempts, and sorting criterion. For BnB, returns resultant pallet and node+pruning stats, returns resultant pallet only for other algos
+def process_order(order, algo, max_attempts=DEFAULT_MAX_ATTEMPTS, criterion=DEFAULT_CRITERION, metric=DEFAULT_OPTIMIZATION_METRIC, order_dict=orders_dict, leave_tqdm=True, optimality_guarantee=None, num_extpts_to_try=None, use_mp=True):     # Process a given order using the specified algorithm, max attempts, and sorting criterion. For BnB, returns resultant pallet and node+pruning stats, returns resultant pallet only for other algos
     box_list = get_box_list_from_order(order, order_dict)
     pallet = Pallet()
 
@@ -702,7 +703,10 @@ def process_order(order, algo, max_attempts=DEFAULT_MAX_ATTEMPTS, criterion=DEFA
         return pallet, nodes
 
     elif algo == Algorithm.BNB:
-        bnb_stats = place_box_list_branch_and_bound(pallet, box_list, criterion=criterion, leave_tqdm=leave_tqdm, optimality_guarantee=optimality_guarantee, num_extpts_to_try=BNB_TOPX_DEFAULT_LIMIT)
+        if use_mp == False:
+            bnb_stats = place_box_list_branch_and_bound(pallet, box_list, criterion=criterion, leave_tqdm=leave_tqdm, optimality_guarantee=optimality_guarantee, num_extpts_to_try=num_extpts_to_try)
+        elif use_mp == True:
+            bnb_stats = place_box_list_branch_and_bound_mc(pallet, box_list, criterion=criterion, leave_tqdm=leave_tqdm, optimality_guarantee=optimality_guarantee, num_extpts_to_try=num_extpts_to_try, cores=DEFAULT_MP_CORES)
         return pallet, bnb_stats
 
 def get_box_orientations(dx, dy, dz, rot_h=HOR_ROTATION_ALLOWED_DEFAULT, rot_v=VER_ROTATION_ALLOWED_DEFAULT):                           # Get a list of possible orientations for a box with given dimensions, based on allowed rotations
@@ -1319,8 +1323,19 @@ def place_box_list_branch_and_bound_mc(pallet, box_list, criterion=DEFAULT_CRITE
         dimension_tuples, initial_best_score,
     )
 
+    # In a notebook, worker functions live in the interactive __main__ module.
+    # Python 3.14 uses forkserver by default on POSIX, and forkserver cannot
+    # import functions defined in a notebook cell. Explicit fork inherits the
+    # already-defined notebook namespace, so the module-level worker functions
+    # and Pallet class are available in every child process.
+    if NOTEBOOK_MODE and "fork" in mp.get_all_start_methods():
+        mp_context = mp.get_context("fork")
+    else:
+        mp_context = None
+
     with concurrent.futures.ProcessPoolExecutor(
             max_workers=worker_count,
+            mp_context=mp_context,
             initializer=_bnb_mc_init_worker,
             initargs=initializer_args) as executor:
         results = list(executor.map(_bnb_mc_search_root, root_tasks))
@@ -1363,6 +1378,7 @@ def place_box_list_branch_and_bound_mc(pallet, box_list, criterion=DEFAULT_CRITE
         'optimality_guarantee': use_guarantee,
         'topx_limit': num_extpts_to_try,
     }
+
 
 # %% [markdown]
 # #### Testing Functions
@@ -1707,7 +1723,7 @@ def run_algorithm_comparison_test(start_order=1, end_order=None, order_dict=test
     
     return results_df
 
-def run_bnb_mc_speed_comparison(mp_core_min=2, mp_core_max=DEFAULT_MP_CORES, mp_core_step=2, start_order=1, end_order=None, order_dict=test_orders_dict, criterion=DEFAULT_CRITERION, metric=Metric.MAX_Z, print_pallets=True, save_pallets=False, bnb_topx=BNB_TOPX_DEFAULT_LIMIT):
+def run_bnb_mc_speed_comparison(mp_core_min=2, mp_core_max=DEFAULT_MP_CORES, mp_core_step=2, start_order=1, end_order=None, order_dict=test_orders_dict, criterion=DEFAULT_CRITERION, metric=Metric.MAX_Z, print_pallets=False, save_pallets=False, bnb_topx=BNB_TOPX_DEFAULT_LIMIT):
     """Compare serial and multi-core BnB runtimes and verify identical pallets.
 
     One serial baseline is run per order, followed by one multi-core run for
@@ -1955,7 +1971,7 @@ testing_random_fulfillment = False
 testing_optg_comparisons = False
 testing_topx_comparisons = False
 testing_algo_comparisons = False
-testing_speed_comparison = True
+testing_speed_comparisons = True
 
 given_order_list = list(range(1, 41))
 type_2_test_order_list = list(range(1000, 4000))
@@ -1969,8 +1985,8 @@ algo_missing_test_orders = [3871, 3922, 3959]
 
 if __name__ == "__main__":
     if NOTEBOOK_MODE:
-        if testing_speed_comparison:
-            run_bnb_mc_speed_comparison(2, 8, 2, 10, 25, test_orders_dict)
+        if testing_speed_comparisons:
+            run_bnb_mc_speed_comparison(2, DEFAULT_MP_CORES, 2, 10, 25, test_orders_dict, DEFAULT_CRITERION, Metric.MAX_Z, False)
         elif current_algo == Algorithm.BNB:
             testpallet, bnb_stats = process_order(current_orderID, algo=current_algo, criterion=current_criterion, order_dict=current_order_dict, metric=current_metric, num_extpts_to_try=current_nett)
             testpallet.get_pallet_results(current_algo, current_orderID, current_order_dict, print_mode=True, bnb_stats=bnb_stats)
@@ -2051,6 +2067,9 @@ if __name__ == "__main__":
                         print_pallets=False, 
                         save_pallets=False,
                         )
+
+    elif testing_speed_comparisons:
+        run_bnb_mc_speed_comparison(2, DEFAULT_MP_CORES, 8, 3200, 3299, test_orders_dict)
     
     else:
         print("No workload specified. Exiting...")
