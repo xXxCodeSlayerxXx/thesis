@@ -46,7 +46,10 @@ class Algorithm(Enum):                                                          
     BFD = "bfd"
     BNB = "bnb"
 
-_BNB_MC_STATE = None                                                            # Instantiate state for multicore branch and bound
+_BNB_MC_STATE = None
+_SHARED_BEST_SCORE = None
+_SHARED_SOURCE_TASK = None
+_SHARED_LOCK = None                                                           # Instantiate state for multicore branch and bound
 
 MAXIMIZE_METRICS = [Metric.PACKING_SCORE, Metric.VOLUME_UTILIZATION]            # Define which metrics should be maximized vs minimized (higher is better vs lower is better)
 MINIMIZE_METRICS = [Metric.COG_Z, Metric.MAX_Z]
@@ -66,7 +69,7 @@ BNB_OPTIMALITY_GUARANTEE        = False                                         
 DEFAULT_MAX_ATTEMPTS            = 2000                                          # Default cutoff for random attempts to place boxes
 SUPPORTED_AREA_PERCENTAGE       = 70                                            # Percentage of pallet area that must be supported under a box for it to be placed
 BNB_TOPX_DEFAULT_LIMIT          = 5                                             # Default limit amount for BnB Filter 5
-BNB_MC_TASK_OVERSUBSCRIPTION    = 4                                             # Multi-core BnB: generate this many tasks per requested core, so uneven subtree sizes get load-balanced across workers instead of leaving idle cores
+BNB_MC_TASK_OVERSUBSCRIPTION    = 8                                             # Multi-core BnB: generate this many tasks per requested core, so uneven subtree sizes get load-balanced across workers instead of leaving idle cores
 
 # %% [markdown]
 # #### Data loading and precomputing
@@ -775,8 +778,9 @@ def calculate_cumulative_volume_dicts(box_list):                                
 def _bnb_mc_init_worker(pallet_dims, sorted_box_list, use_guarantee,
                         num_extpts_to_try, box_orientations_dict,
                         tallest_remaining_orientations, dimension_tuples,
-                        initial_best_score):
-    global _BNB_MC_STATE
+                        initial_best_score, shared_best_score,
+                        shared_source_task, shared_lock):
+    global _BNB_MC_STATE, _SHARED_BEST_SCORE, _SHARED_SOURCE_TASK, _SHARED_LOCK
     _BNB_MC_STATE = (
         pallet_dims,
         sorted_box_list,
@@ -787,6 +791,9 @@ def _bnb_mc_init_worker(pallet_dims, sorted_box_list, use_guarantee,
         dimension_tuples,
         initial_best_score,
     )
+    _SHARED_BEST_SCORE = shared_best_score
+    _SHARED_SOURCE_TASK = shared_source_task
+    _SHARED_LOCK = shared_lock
 
 def _bnb_mc_zero_counts():
     return {
@@ -798,11 +805,7 @@ def _bnb_expand_single_node(pallet, box_index, sequence, sorted_box_list,
                             use_guarantee, num_extpts_to_try,
                             box_orientations_dict, tallest_remaining_orientations,
                             dimension_tuples, best_score, counts):
-    """Generate all valid child branches for a single node.
-    
-    Mutates `pallet` during expansion but restores it cleanly upon return.
-    Returns a list of tuples: (box_index + 1, updated_sequence).
-    """
+    """Expand one node. Mutates `pallet` during expansion but restores it on exit."""
     n_boxes = len(sorted_box_list)
     if box_index >= n_boxes:
         return []
@@ -879,73 +882,71 @@ def _bnb_mc_generate_frontier_tasks(pallet_dims, sorted_box_list, use_guarantee,
                                      num_extpts_to_try, box_orientations_dict,
                                      tallest_remaining_orientations, dimension_tuples,
                                      initial_best_score, target_task_count):
-    """Breadth-first expansion of active tree nodes until target_task_count is satisfied.
+    """Uniform level-by-level breadth expansion.
     
-    Eliminates dead branches in the main process, ensuring that every task
-    submitted to the process pool represents active work. In-place list
-    replacement preserves strict DFS pre-order traversal for tie-breaking.
+    Expands full levels across all active branches to prevent jagged, unbalanced tasks.
+    Completed leaves are kept out of the worker queue.
     """
     counts = _bnb_mc_zero_counts()
     best_score = initial_best_score
     best_sequence = None
     n_boxes = len(sorted_box_list)
 
-    # Queue of nodes: each entry is (box_index, sequence)
     frontier = [(0, [])]
     pallet = Pallet(dims=pallet_dims)
+    depth = 0
 
-    while len(frontier) < target_task_count:
-        # Find the shallowest expandable branch
-        expandable_idx = None
-        min_depth = n_boxes
-        for idx, (b_idx, _) in enumerate(frontier):
-            if b_idx < n_boxes and b_idx < min_depth:
-                min_depth = b_idx
-                expandable_idx = idx
+    while len(frontier) < target_task_count and depth < n_boxes:
+        next_frontier = []
+        expanded_any = False
 
-        if expandable_idx is None:
-            # All available branches have reached full depth or pruned
+        for b_idx, seq in frontier:
+            if b_idx == n_boxes:
+                next_frontier.append((b_idx, seq))
+                continue
+
+            pallet.reset()
+            for dims, x, y in seq:
+                pallet.place_box(dims, x, y)
+
+            children = _bnb_expand_single_node(
+                pallet, b_idx, seq, sorted_box_list, use_guarantee,
+                num_extpts_to_try, box_orientations_dict,
+                tallest_remaining_orientations, dimension_tuples,
+                best_score, counts
+            )
+
+            if children:
+                expanded_any = True
+                for child_b_idx, child_seq in children:
+                    if child_b_idx == n_boxes:
+                        pallet.reset()
+                        for d, x, y in child_seq:
+                            pallet.place_box(d, x, y)
+                        sc = pallet.get_max_height()
+                        if sc < best_score:
+                            best_score = sc
+                            best_sequence = list(child_seq)
+                    next_frontier.append((child_b_idx, child_seq))
+
+        if not expanded_any:
             break
 
-        b_idx, seq = frontier[expandable_idx]
-        
-        # Reconstruct pallet state for this node
-        pallet.reset()
-        for dims, x, y in seq:
-            pallet.place_box(dims, x, y)
+        frontier = next_frontier
+        depth += 1
 
-        children = _bnb_expand_single_node(
-            pallet, b_idx, seq, sorted_box_list, use_guarantee,
-            num_extpts_to_try, box_orientations_dict, tallest_remaining_orientations,
-            dimension_tuples, best_score, counts
-        )
-
-        # Check if any generated children are complete solutions
-        for child_b_idx, child_seq in children:
-            if child_b_idx == n_boxes:
-                pallet.reset()
-                for d, x, y in child_seq:
-                    pallet.place_box(d, x, y)
-                score = pallet.get_max_height()
-                if score < best_score:
-                    best_score = score
-                    best_sequence = list(child_seq)
-
-        # In-place replacement: maintains strict serial DFS ordering
-        frontier[expandable_idx:expandable_idx + 1] = children
-
-    tasks = [(i, b_idx, seq) for i, (b_idx, seq) in enumerate(frontier)]
-    max_depth = max((len(seq) for _, _, seq in tasks), default=0)
-    return tasks, counts, best_score, best_sequence, max_depth
+    # Filter out completed leaves so workers only receive subtrees with real search work
+    active_frontier = [node for node in frontier if node[0] < n_boxes]
+    tasks = [(i, b_idx, seq) for i, (b_idx, seq) in enumerate(active_frontier)]
+    return tasks, counts, best_score, best_sequence, depth
 
 def _bnb_mc_search_task(task):
-    """Worker task search. Evaluates an assigned subtree independently."""
+    """Worker task search using dynamic shared-bound pruning."""
     task_index, box_index, sequence = task
     (pallet_dims, sorted_box_list, use_guarantee, num_extpts_to_try,
      box_orientations_dict, tallest_remaining_orientations, dimension_tuples,
      initial_best_score) = _BNB_MC_STATE
 
-    # Initialize a clean Pallet instance per task to avoid shared state or mutation leaks
     pallet = Pallet(dims=pallet_dims)
     for dims, x, y in sequence:
         delta = pallet.place_box(dims, x, y)
@@ -961,17 +962,31 @@ def _bnb_mc_search_task(task):
     def recursive_place(b_idx):
         nonlocal best_score, best_sequence
 
+        # Dynamic cross-process pruning bound
+        # Tasks to the right of the bound-owner prune with >= (cannot win ties);
+        # tasks to the left prune with > (preserves potential winning ties).
+        g_bound = _SHARED_BEST_SCORE.value
+        g_source = _SHARED_SOURCE_TASK.value
+        effective_limit = min(best_score, g_bound if task_index > g_source else g_bound + 1)
+
         if b_idx == n_boxes:
             current_score = pallet.get_max_height()
             if current_score < best_score:
                 best_score = current_score
                 best_sequence = list(current_sequence)
+                with _SHARED_LOCK:
+                    if (current_score < _SHARED_BEST_SCORE.value or
+                        (current_score == _SHARED_BEST_SCORE.value and task_index < _SHARED_SOURCE_TASK.value)):
+                        _SHARED_BEST_SCORE.value = current_score
+                        _SHARED_SOURCE_TASK.value = task_index
             return
 
-        if pallet.get_max_height() >= best_score:
+        # Rule 1
+        if pallet.get_max_height() >= effective_limit:
             counts['pruned_rule1'] += 1
             return
 
+        # Rule 4
         t_orientations = tallest_remaining_orientations[b_idx]
         min_landing_z = pallet.size_z + 100
         for cx, cy in pallet.extpts:
@@ -980,7 +995,7 @@ def _bnb_mc_search_task(task):
                     landing_z = pallet.get_max_height_in_area(cx, cy, candidate_dims[0], candidate_dims[1])
                     min_landing_z = min(min_landing_z, landing_z + candidate_dims[2])
 
-        if pallet.size_z + 100 > min_landing_z >= best_score:
+        if pallet.size_z + 100 > min_landing_z >= effective_limit:
             counts['pruned_rule4'] += 1
             return
 
@@ -1033,14 +1048,14 @@ def _bnb_mc_search_task(task):
             current_sequence.pop()
             pallet.remove_box(delta)
 
-    if box_index == n_boxes:
-        current_score = pallet.get_max_height()
-        if current_score < best_score:
-            best_score = current_score
-            best_sequence = list(current_sequence)
-    else:
-        recursive_place(box_index)
+    # Initial check prior to entering subtree
+    init_bound = _SHARED_BEST_SCORE.value
+    init_source = _SHARED_SOURCE_TASK.value
+    init_limit = min(best_score, init_bound if task_index > init_source else init_bound + 1)
+    if pallet.get_max_height() >= init_limit:
+        return task_index, None, best_score, counts
 
+    recursive_place(box_index)
     return task_index, best_sequence, best_score, counts
 
 # %% [markdown]
@@ -1339,7 +1354,7 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
 def place_box_list_branch_and_bound_mc(pallet, box_list, criterion=DEFAULT_CRITERION,
                                        leave_tqdm=True, optimality_guarantee=None,
                                        num_extpts_to_try=None, cores=1):
-    """Multi-core BnB algorithm scaling smoothly across 128+ cores."""
+    """Multi-core BnB algorithm with dynamic bound sharing and balanced subtrees."""
     if not isinstance(cores, int) or isinstance(cores, bool) or cores < 1:
         raise ValueError("cores must be a positive integer")
 
@@ -1384,7 +1399,7 @@ def place_box_list_branch_and_bound_mc(pallet, box_list, criterion=DEFAULT_CRITE
         for boxid in sorted_box_list
     ]
 
-    target_task_count = cores * BNB_MC_TASK_OVERSUBSCRIPTION
+    target_task_count = max(cores * BNB_MC_TASK_OVERSUBSCRIPTION, 256)
     pallet_dims = (pallet.size_x, pallet.size_y, pallet.size_z)
 
     (tasks, frontier_counts, frontier_best_score,
@@ -1394,37 +1409,38 @@ def place_box_list_branch_and_bound_mc(pallet, box_list, criterion=DEFAULT_CRITE
         dimension_tuples, initial_best_score, target_task_count
     )
 
-    # If the search space was small enough to resolve completely during frontier expansion:
-    all_leaves = len(tasks) > 0 and all(b_idx == len(sorted_box_list) for _, b_idx, _ in tasks)
-    if all_leaves or len(tasks) <= 1:
+    # Return immediately if search space resolved completely during frontier expansion
+    if len(tasks) == 0:
         if frontier_best_seq:
             for dims, x, y in frontier_best_seq:
                 pallet.place_box(dims, x, y)
-            return {
-                'nodes': frontier_counts['nodes'],
-                'pruned_rule1': frontier_counts['pruned_rule1'],
-                'pruned_rule4': frontier_counts['pruned_rule4'],
-                'pruned_filt1': frontier_counts['pruned_filt1'],
-                'pruned_filt2': frontier_counts['pruned_filt2'],
-                'pruned_filt5': frontier_counts['pruned_filt5'],
-                'best_score': frontier_best_score,
-                'optimality_guarantee': use_guarantee,
-                'topx_limit': num_extpts_to_try,
-                'tasks': len(tasks),
-                'task_depth': max_depth,
-                'workers': 1,
-            }
-        return place_box_list_branch_and_bound(
-            pallet, box_list, criterion=criterion, leave_tqdm=leave_tqdm,
-            optimality_guarantee=optimality_guarantee,
-            num_extpts_to_try=num_extpts_to_try,
-        )
+        return {
+            'nodes': frontier_counts['nodes'],
+            'pruned_rule1': frontier_counts['pruned_rule1'],
+            'pruned_rule4': frontier_counts['pruned_rule4'],
+            'pruned_filt1': frontier_counts['pruned_filt1'],
+            'pruned_filt2': frontier_counts['pruned_filt2'],
+            'pruned_filt5': frontier_counts['pruned_filt5'],
+            'best_score': frontier_best_score,
+            'optimality_guarantee': use_guarantee,
+            'topx_limit': num_extpts_to_try,
+            'tasks': len(tasks),
+            'task_depth': max_depth,
+            'workers': 1,
+        }
 
     worker_count = min(cores, len(tasks))
+
+    # Shared cross-process state for dynamic pruning
+    shared_best_score = mp.RawValue('i', frontier_best_score)
+    shared_source_task = mp.RawValue('i', 9999999)
+    shared_lock = mp.Lock()
+
     initializer_args = (
         pallet_dims, sorted_box_list, use_guarantee, num_extpts_to_try,
         box_orientations_dict, tallest_remaining_orientations,
         dimension_tuples, frontier_best_score,
+        shared_best_score, shared_source_task, shared_lock,
     )
 
     mp_context = mp.get_context("fork") if "fork" in mp.get_all_start_methods() else None
@@ -1844,7 +1860,7 @@ def run_bnb_mc_speed_comparison(mp_core_min=2, mp_core_max=DEFAULT_MP_CORES, mp_
             f"No orders found from {start_order} through {end_order} in order_dict"
         )
 
-    core_counts = list(range(mp_core_min, mp_core_max + 1, mp_core_step))
+    core_counts = reversed(list(range(mp_core_min, mp_core_max + 1, mp_core_step)))
     result_rows = []
 
     def canonical_boxes(pallet_to_compare):
