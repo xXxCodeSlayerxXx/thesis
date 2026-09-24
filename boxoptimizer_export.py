@@ -772,13 +772,13 @@ def calculate_cumulative_volume_dicts(box_list):                                
         
     return cumulative_volume_dict, volume_to_go_dict
 
-def _bnb_mc_init_worker(base_pallet, sorted_box_list, use_guarantee,
+def _bnb_mc_init_worker(pallet_dims, sorted_box_list, use_guarantee,
                         num_extpts_to_try, box_orientations_dict,
                         tallest_remaining_orientations, dimension_tuples,
                         initial_best_score):
     global _BNB_MC_STATE
     _BNB_MC_STATE = (
-        base_pallet,
+        pallet_dims,
         sorted_box_list,
         use_guarantee,
         num_extpts_to_try,
@@ -794,152 +794,174 @@ def _bnb_mc_zero_counts():
         'pruned_filt1': 0, 'pruned_filt2': 0, 'pruned_filt5': 0,
     }
 
-def _bnb_mc_generate_frontier_tasks(pallet, sorted_box_list, use_guarantee, num_extpts_to_try,
-                                     box_orientations_dict, tallest_remaining_orientations,
-                                     dimension_tuples, initial_best_score, target_depth):
-    """Depth-first expansion of the search tree down to `target_depth`, collecting one
-    task per subtree root reached (or per branch that resolves into a complete
-    placement before reaching that depth).
-
-    Splitting work across only the very first box's placements (the old approach)
-    caps the number of tasks at a handful, because an empty pallet has exactly one
-    extreme point (0, 0): task count = (unique orientations of box 0) x 1, further
-    cut down by Filter 5's top-X limit. That cap is independent of how many cores
-    are requested, which is why worker/core usage plateaued. Expanding several
-    levels deep instead multiplies the branching factor across each of those
-    levels, so there are enough independent subtrees to keep every requested core
-    fed, with headroom left over for load balancing.
-
-    This applies the identical Rule 1 / Rule 4 bounding and Filter 1/2/5 branching
-    logic used by the single-core recursive search, so the tasks produced -- and
-    the order they are produced in -- are exactly what the single-core algorithm
-    would visit first, left to right. `pallet` is mutated while walking down to
-    `target_depth` and back for every branch, but is always fully restored to its
-    original state by the time this function returns.
-
-    Returns (tasks, counts): each task is (task_index, box_index, sequence), where
-    `sequence` is the list of (dims, x, y) placements from `pallet`'s original
-    state down to that task's subtree root, and `box_index` is how many boxes of
-    `sorted_box_list` that sequence has already placed.
+def _bnb_expand_single_node(pallet, box_index, sequence, sorted_box_list,
+                            use_guarantee, num_extpts_to_try,
+                            box_orientations_dict, tallest_remaining_orientations,
+                            dimension_tuples, best_score, counts):
+    """Generate all valid child branches for a single node.
+    
+    Mutates `pallet` during expansion but restores it cleanly upon return.
+    Returns a list of tuples: (box_index + 1, updated_sequence).
     """
-    tasks = []
+    n_boxes = len(sorted_box_list)
+    if box_index >= n_boxes:
+        return []
+
+    # Rule 1 (Trivial Bounding)
+    if pallet.get_max_height() >= best_score:
+        counts['pruned_rule1'] += 1
+        return []
+
+    # Rule 4 (Tall-Low Bounding)
+    t_orientations = tallest_remaining_orientations[box_index]
+    min_landing_z = pallet.size_z + 100
+    for x, y in pallet.extpts:
+        for dims in t_orientations:
+            if pallet.check_box_placement_validity(dims, x, y):
+                landing_z = pallet.get_max_height_in_area(x, y, dims[0], dims[1])
+                min_landing_z = min(min_landing_z, landing_z + dims[2])
+
+    if pallet.size_z + 100 > min_landing_z >= best_score:
+        counts['pruned_rule4'] += 1
+        return []
+
+    boxid = sorted_box_list[box_index]
+    orientations = box_orientations_dict[boxid]
+    sorted_extpts = sorted(pallet.extpts)
+    seen_profile_keys = set() if not use_guarantee else None
+
+    if box_index > 0 and dimension_tuples[box_index] == dimension_tuples[box_index - 1]:
+        filt2_key = sequence[-1]
+    else:
+        filt2_key = None
+
+    candidate_placements = []
+    for dims in orientations:
+        for x, y in sorted_extpts:
+            if pallet.check_box_placement_validity(dims, x, y):
+                landing_z = pallet.get_max_height_in_area(x, y, dims[0], dims[1])
+                top_z = landing_z + dims[2]
+                candidate_placements.append(((top_z, x + y), dims, x, y))
+
+    if not use_guarantee and num_extpts_to_try is not None:
+        candidate_placements.sort(key=lambda c: c[0])
+        filtered = max(0, len(candidate_placements) - num_extpts_to_try)
+        candidate_placements = candidate_placements[:num_extpts_to_try]
+        counts['pruned_filt5'] += filtered
+
+    children = []
+    for _, dims, x, y in candidate_placements:
+        if not use_guarantee:
+            z = pallet.get_max_height_in_area(x, y, dims[0], dims[1])
+            profile_key = (dims, z)
+            if profile_key in seen_profile_keys:
+                counts['pruned_filt1'] += 1
+                continue
+
+        if filt2_key is not None and filt2_key > (dims, x, y):
+            counts['pruned_filt2'] += 1
+            continue
+
+        delta = pallet.place_box(dims, x, y)
+        if not delta:
+            continue
+
+        if not use_guarantee:
+            seen_profile_keys.add(profile_key)
+
+        counts['nodes'] += 1
+        children.append((box_index + 1, sequence + [(dims, x, y)]))
+        pallet.remove_box(delta)
+
+    return children
+
+def _bnb_mc_generate_frontier_tasks(pallet_dims, sorted_box_list, use_guarantee,
+                                     num_extpts_to_try, box_orientations_dict,
+                                     tallest_remaining_orientations, dimension_tuples,
+                                     initial_best_score, target_task_count):
+    """Breadth-first expansion of active tree nodes until target_task_count is satisfied.
+    
+    Eliminates dead branches in the main process, ensuring that every task
+    submitted to the process pool represents active work. In-place list
+    replacement preserves strict DFS pre-order traversal for tie-breaking.
+    """
     counts = _bnb_mc_zero_counts()
-    current_sequence = []
+    best_score = initial_best_score
+    best_sequence = None
     n_boxes = len(sorted_box_list)
 
-    def expand(box_index, remaining_depth):
-        if box_index == n_boxes:
-            # Branch resolved into a complete placement before the cutoff depth;
-            # hand it back as a zero-work task so it still competes fairly in
-            # the final reduction.
-            tasks.append((len(tasks), box_index, list(current_sequence)))
-            return
+    # Queue of nodes: each entry is (box_index, sequence)
+    frontier = [(0, [])]
+    pallet = Pallet(dims=pallet_dims)
 
-        if remaining_depth == 0:
-            tasks.append((len(tasks), box_index, list(current_sequence)))
-            return
+    while len(frontier) < target_task_count:
+        # Find the shallowest expandable branch
+        expandable_idx = None
+        min_depth = n_boxes
+        for idx, (b_idx, _) in enumerate(frontier):
+            if b_idx < n_boxes and b_idx < min_depth:
+                min_depth = b_idx
+                expandable_idx = idx
 
-        if pallet.get_max_height() >= initial_best_score:
-            counts['pruned_rule1'] += 1
-            return
+        if expandable_idx is None:
+            # All available branches have reached full depth or pruned
+            break
 
-        t_orientations = tallest_remaining_orientations[box_index]
-        min_landing_z = PALLET_DIMS[2] + 100
-        for x, y in pallet.extpts:
-            for dims in t_orientations:
-                if pallet.check_box_placement_validity(dims, x, y):
-                    landing_z = pallet.get_max_height_in_area(x, y, dims[0], dims[1])
-                    min_landing_z = min(min_landing_z, landing_z + dims[2])
+        b_idx, seq = frontier[expandable_idx]
+        
+        # Reconstruct pallet state for this node
+        pallet.reset()
+        for dims, x, y in seq:
+            pallet.place_box(dims, x, y)
 
-        if PALLET_DIMS[2] + 100 > min_landing_z >= initial_best_score:
-            counts['pruned_rule4'] += 1
-            return
+        children = _bnb_expand_single_node(
+            pallet, b_idx, seq, sorted_box_list, use_guarantee,
+            num_extpts_to_try, box_orientations_dict, tallest_remaining_orientations,
+            dimension_tuples, best_score, counts
+        )
 
-        boxid = sorted_box_list[box_index]
-        orientations = box_orientations_dict[boxid]
-        sorted_extpts = sorted(pallet.extpts)
-        seen_profile_keys = set() if not use_guarantee else None
+        # Check if any generated children are complete solutions
+        for child_b_idx, child_seq in children:
+            if child_b_idx == n_boxes:
+                pallet.reset()
+                for d, x, y in child_seq:
+                    pallet.place_box(d, x, y)
+                score = pallet.get_max_height()
+                if score < best_score:
+                    best_score = score
+                    best_sequence = list(child_seq)
 
-        # As at the true root of the single-core search, there is no predecessor
-        # placement to compare against at box_index 0.
-        if box_index > 0 and dimension_tuples[box_index] == dimension_tuples[box_index - 1]:
-            filt2_key = current_sequence[-1]
-        else:
-            filt2_key = None
+        # In-place replacement: maintains strict serial DFS ordering
+        frontier[expandable_idx:expandable_idx + 1] = children
 
-        candidate_placements = []
-        for dims in orientations:
-            for x, y in sorted_extpts:
-                if pallet.check_box_placement_validity(dims, x, y):
-                    landing_z = pallet.get_max_height_in_area(x, y, dims[0], dims[1])
-                    top_z = landing_z + dims[2]
-                    candidate_placements.append(((top_z, x + y), dims, x, y))
-
-        if not use_guarantee and num_extpts_to_try is not None:
-            candidate_placements.sort(key=lambda c: c[0])
-            filtered = max(0, len(candidate_placements) - num_extpts_to_try)
-            candidate_placements = candidate_placements[:num_extpts_to_try]
-            counts['pruned_filt5'] += filtered
-
-        for _, dims, x, y in candidate_placements:
-            if not use_guarantee:
-                z = pallet.get_max_height_in_area(x, y, dims[0], dims[1])
-                profile_key = (dims, z)
-                if profile_key in seen_profile_keys:
-                    counts['pruned_filt1'] += 1
-                    continue
-
-            if filt2_key is not None and filt2_key > (dims, x, y):
-                counts['pruned_filt2'] += 1
-                continue
-
-            delta = pallet.place_box(dims, x, y)
-            if not delta:
-                continue
-
-            if not use_guarantee:
-                seen_profile_keys.add(profile_key)
-
-            current_sequence.append((dims, x, y))
-            counts['nodes'] += 1
-            expand(box_index + 1, remaining_depth - 1)
-            current_sequence.pop()
-            pallet.remove_box(delta)
-
-    expand(0, target_depth)
-    return tasks, counts
+    tasks = [(i, b_idx, seq) for i, (b_idx, seq) in enumerate(frontier)]
+    max_depth = max((len(seq) for _, _, seq in tasks), default=0)
+    return tasks, counts, best_score, best_sequence, max_depth
 
 def _bnb_mc_search_task(task):
-    """Search one subtree task. Must remain at module scope for multiprocessing."""
+    """Worker task search. Evaluates an assigned subtree independently."""
     task_index, box_index, sequence = task
-    (base_pallet, sorted_box_list, use_guarantee, num_extpts_to_try,
+    (pallet_dims, sorted_box_list, use_guarantee, num_extpts_to_try,
      box_orientations_dict, tallest_remaining_orientations, dimension_tuples,
      initial_best_score) = _BNB_MC_STATE
 
-    # A process receives its own pickled base pallet. Mutating it is safe, but a
-    # worker can execute several tasks, so replay this task's path down from the
-    # root and undo it again once the subtree below it has been searched.
-    pallet = base_pallet
-    applied_deltas = []
+    # Initialize a clean Pallet instance per task to avoid shared state or mutation leaks
+    pallet = Pallet(dims=pallet_dims)
     for dims, x, y in sequence:
         delta = pallet.place_box(dims, x, y)
         if not delta:
-            # The sequence was already validated when the task was generated;
-            # bail out defensively rather than search from a corrupted state.
-            for applied in reversed(applied_deltas):
-                pallet.remove_box(applied)
             return task_index, None, initial_best_score, _bnb_mc_zero_counts()
-        applied_deltas.append(delta)
 
     current_sequence = list(sequence)
     best_sequence = None
     best_score = initial_best_score
     counts = _bnb_mc_zero_counts()
+    n_boxes = len(sorted_box_list)
 
-    def recursive_place(box_index):
+    def recursive_place(b_idx):
         nonlocal best_score, best_sequence
 
-        if box_index == len(sorted_box_list):
+        if b_idx == n_boxes:
             current_score = pallet.get_max_height()
             if current_score < best_score:
                 best_score = current_score
@@ -950,28 +972,24 @@ def _bnb_mc_search_task(task):
             counts['pruned_rule1'] += 1
             return
 
-        t_orientations = tallest_remaining_orientations[box_index]
-        min_landing_z = PALLET_DIMS[2] + 100
+        t_orientations = tallest_remaining_orientations[b_idx]
+        min_landing_z = pallet.size_z + 100
         for cx, cy in pallet.extpts:
             for candidate_dims in t_orientations:
                 if pallet.check_box_placement_validity(candidate_dims, cx, cy):
-                    landing_z = pallet.get_max_height_in_area(
-                        cx, cy, candidate_dims[0], candidate_dims[1]
-                    )
-                    min_landing_z = min(
-                        min_landing_z, landing_z + candidate_dims[2]
-                    )
+                    landing_z = pallet.get_max_height_in_area(cx, cy, candidate_dims[0], candidate_dims[1])
+                    min_landing_z = min(min_landing_z, landing_z + candidate_dims[2])
 
-        if PALLET_DIMS[2] + 100 > min_landing_z >= best_score:
+        if pallet.size_z + 100 > min_landing_z >= best_score:
             counts['pruned_rule4'] += 1
             return
 
-        boxid = sorted_box_list[box_index]
+        boxid = sorted_box_list[b_idx]
         orientations = box_orientations_dict[boxid]
         sorted_extpts = sorted(pallet.extpts)
         seen_profile_keys = set() if not use_guarantee else None
 
-        if dimension_tuples[box_index] == dimension_tuples[box_index - 1]:
+        if b_idx > 0 and dimension_tuples[b_idx] == dimension_tuples[b_idx - 1]:
             filt2_key = current_sequence[-1]
         else:
             filt2_key = None
@@ -980,28 +998,19 @@ def _bnb_mc_search_task(task):
         for candidate_dims in orientations:
             for cx, cy in sorted_extpts:
                 if pallet.check_box_placement_validity(candidate_dims, cx, cy):
-                    landing_z = pallet.get_max_height_in_area(
-                        cx, cy, candidate_dims[0], candidate_dims[1]
-                    )
+                    landing_z = pallet.get_max_height_in_area(cx, cy, candidate_dims[0], candidate_dims[1])
                     top_z = landing_z + candidate_dims[2]
-                    score = (top_z, cx + cy)
-                    candidate_placements.append(
-                        (score, candidate_dims, cx, cy)
-                    )
+                    candidate_placements.append(((top_z, cx + cy), candidate_dims, cx, cy))
 
         if not use_guarantee and num_extpts_to_try is not None:
             candidate_placements.sort(key=lambda c: c[0])
-            filtered = max(
-                0, len(candidate_placements) - num_extpts_to_try
-            )
+            filtered = max(0, len(candidate_placements) - num_extpts_to_try)
             candidate_placements = candidate_placements[:num_extpts_to_try]
             counts['pruned_filt5'] += filtered
 
         for _, candidate_dims, cx, cy in candidate_placements:
             if not use_guarantee:
-                z = pallet.get_max_height_in_area(
-                    cx, cy, candidate_dims[0], candidate_dims[1]
-                )
+                z = pallet.get_max_height_in_area(cx, cy, candidate_dims[0], candidate_dims[1])
                 profile_key = (candidate_dims, z)
                 if profile_key in seen_profile_keys:
                     counts['pruned_filt1'] += 1
@@ -1020,24 +1029,19 @@ def _bnb_mc_search_task(task):
 
             current_sequence.append((candidate_dims, cx, cy))
             counts['nodes'] += 1
-            recursive_place(box_index + 1)
+            recursive_place(b_idx + 1)
             current_sequence.pop()
             pallet.remove_box(delta)
 
-    try:
-        if box_index == len(sorted_box_list):
-            # This task's sequence is already a complete placement (the box list
-            # was shallower than the frontier's cutoff depth); nothing left to search.
-            current_score = pallet.get_max_height()
-            if current_score < best_score:
-                best_score = current_score
-                best_sequence = list(current_sequence)
-        else:
-            recursive_place(box_index)
-        return task_index, best_sequence, best_score, counts
-    finally:
-        for applied in reversed(applied_deltas):
-            pallet.remove_box(applied)
+    if box_index == n_boxes:
+        current_score = pallet.get_max_height()
+        if current_score < best_score:
+            best_score = current_score
+            best_sequence = list(current_sequence)
+    else:
+        recursive_place(box_index)
+
+    return task_index, best_sequence, best_score, counts
 
 # %% [markdown]
 # #### Box Placing Algorithms
@@ -1332,24 +1336,13 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
     }
     return bnb_stats
 
-def place_box_list_branch_and_bound_mc(pallet, box_list, criterion=DEFAULT_CRITERION, leave_tqdm=True, optimality_guarantee=None, num_extpts_to_try=None, cores=1):
-    """Multi-core variant of place_box_list_branch_and_bound.
-
-    The search tree is expanded several levels deep in the main process first
-    (see _bnb_mc_generate_frontier_tasks), collecting enough independent subtree
-    tasks -- with oversubscription -- to keep every requested core fed and to let
-    the process pool rebalance load as workers free up, rather than splitting
-    only across the handful of placements available for the very first box. All
-    bounding rules, filters, candidate scoring, top-X limiting, and depth-first
-    order used to build that frontier and to search each task's subtree
-    afterwards are identical to the single-core implementation. Results are
-    reduced in original left-to-right (pre-order) task order, preserving
-    deterministic tie choice.
-    """
+def place_box_list_branch_and_bound_mc(pallet, box_list, criterion=DEFAULT_CRITERION,
+                                       leave_tqdm=True, optimality_guarantee=None,
+                                       num_extpts_to_try=None, cores=1):
+    """Multi-core BnB algorithm scaling smoothly across 128+ cores."""
     if not isinstance(cores, int) or isinstance(cores, bool) or cores < 1:
         raise ValueError("cores must be a positive integer")
 
-    # This is also the exact fallback for empty/single-branch cases.
     if cores == 1 or not box_list:
         return place_box_list_branch_and_bound(
             pallet, box_list, criterion=criterion, leave_tqdm=leave_tqdm,
@@ -1365,7 +1358,7 @@ def place_box_list_branch_and_bound_mc(pallet, box_list, criterion=DEFAULT_CRITE
         if optimality_guarantee is None else optimality_guarantee
     )
 
-    temp_pallet = Pallet()
+    temp_pallet = Pallet(dims=(pallet.size_x, pallet.size_y, pallet.size_z))
     place_box_list_best_fit_decreasing(
         temp_pallet, sorted_box_list, criterion=criterion
     )
@@ -1391,33 +1384,36 @@ def place_box_list_branch_and_bound_mc(pallet, box_list, criterion=DEFAULT_CRITE
         for boxid in sorted_box_list
     ]
 
-    # Expand the tree deep enough to generate several tasks per requested core
-    # (oversubscription), so uneven subtree sizes get load-balanced across
-    # workers instead of leaving cores idle once their small subtrees finish.
-    # Re-expanding from scratch at an increasing depth is cheap: a bounded
-    # number of shallow-tree nodes, versus the very large full BnB tree each
-    # task will separately search afterwards.
     target_task_count = cores * BNB_MC_TASK_OVERSUBSCRIPTION
-    depth = 1
-    tasks, frontier_counts = _bnb_mc_generate_frontier_tasks(
-        pallet, sorted_box_list, use_guarantee, num_extpts_to_try,
-        box_orientations_dict, tallest_remaining_orientations,
-        dimension_tuples, initial_best_score, target_depth=depth,
-    )
-    while len(tasks) < target_task_count and depth < len(sorted_box_list):
-        next_depth = depth + 1
-        next_tasks, next_counts = _bnb_mc_generate_frontier_tasks(
-            pallet, sorted_box_list, use_guarantee, num_extpts_to_try,
-            box_orientations_dict, tallest_remaining_orientations,
-            dimension_tuples, initial_best_score, target_depth=next_depth,
-        )
-        if len(next_tasks) <= len(tasks):
-            # No further growth possible: every branch already bottomed out
-            # (pruned or completed) before reaching the deeper cutoff.
-            break
-        depth, tasks, frontier_counts = next_depth, next_tasks, next_counts
+    pallet_dims = (pallet.size_x, pallet.size_y, pallet.size_z)
 
-    if len(tasks) <= 1:
+    (tasks, frontier_counts, frontier_best_score,
+     frontier_best_seq, max_depth) = _bnb_mc_generate_frontier_tasks(
+        pallet_dims, sorted_box_list, use_guarantee, num_extpts_to_try,
+        box_orientations_dict, tallest_remaining_orientations,
+        dimension_tuples, initial_best_score, target_task_count
+    )
+
+    # If the search space was small enough to resolve completely during frontier expansion:
+    all_leaves = len(tasks) > 0 and all(b_idx == len(sorted_box_list) for _, b_idx, _ in tasks)
+    if all_leaves or len(tasks) <= 1:
+        if frontier_best_seq:
+            for dims, x, y in frontier_best_seq:
+                pallet.place_box(dims, x, y)
+            return {
+                'nodes': frontier_counts['nodes'],
+                'pruned_rule1': frontier_counts['pruned_rule1'],
+                'pruned_rule4': frontier_counts['pruned_rule4'],
+                'pruned_filt1': frontier_counts['pruned_filt1'],
+                'pruned_filt2': frontier_counts['pruned_filt2'],
+                'pruned_filt5': frontier_counts['pruned_filt5'],
+                'best_score': frontier_best_score,
+                'optimality_guarantee': use_guarantee,
+                'topx_limit': num_extpts_to_try,
+                'tasks': len(tasks),
+                'task_depth': max_depth,
+                'workers': 1,
+            }
         return place_box_list_branch_and_bound(
             pallet, box_list, criterion=criterion, leave_tqdm=leave_tqdm,
             optimality_guarantee=optimality_guarantee,
@@ -1426,38 +1422,23 @@ def place_box_list_branch_and_bound_mc(pallet, box_list, criterion=DEFAULT_CRITE
 
     worker_count = min(cores, len(tasks))
     initializer_args = (
-        pallet, sorted_box_list, use_guarantee, num_extpts_to_try,
+        pallet_dims, sorted_box_list, use_guarantee, num_extpts_to_try,
         box_orientations_dict, tallest_remaining_orientations,
-        dimension_tuples, initial_best_score,
+        dimension_tuples, frontier_best_score,
     )
 
-    # In a notebook, worker functions live in the interactive __main__ module.
-    # Python 3.14 uses forkserver by default on POSIX, and forkserver cannot
-    # import functions defined in a notebook cell. Explicit fork inherits the
-    # already-defined notebook namespace, so the module-level worker functions
-    # and Pallet class are available in every child process.
-    if NOTEBOOK_MODE and "fork" in mp.get_all_start_methods():
-        mp_context = mp.get_context("fork")
-    else:
-        mp_context = None
+    mp_context = mp.get_context("fork") if "fork" in mp.get_all_start_methods() else None
 
     with concurrent.futures.ProcessPoolExecutor(
             max_workers=worker_count,
             mp_context=mp_context,
             initializer=_bnb_mc_init_worker,
             initargs=initializer_args) as executor:
-        # chunksize=1 (the default) is intentional here: subtree sizes are
-        # uneven, so tasks must be handed out one at a time as workers become
-        # free, rather than pre-batched, to keep every core fed.
-        results = list(executor.map(_bnb_mc_search_task, tasks))
+        results = list(executor.map(_bnb_mc_search_task, tasks, chunksize=1))
 
-    # Tasks were generated depth-first in exactly the same left-to-right order
-    # the serial routine visits those nodes, and executor.map retains that
-    # order. Sorting explicitly documents and protects the serial DFS tie
-    # behavior (first-found-wins) if the execution strategy is changed later.
     results.sort(key=lambda result: result[0])
-    best_score = initial_best_score
-    best_sequence = None
+    best_score = frontier_best_score
+    best_sequence = frontier_best_seq
     totals = dict(frontier_counts)
 
     for _, sequence, score, counts in results:
@@ -1484,10 +1465,9 @@ def place_box_list_branch_and_bound_mc(pallet, box_list, criterion=DEFAULT_CRITE
         'optimality_guarantee': use_guarantee,
         'topx_limit': num_extpts_to_try,
         'tasks': len(tasks),
-        'task_depth': depth,
+        'task_depth': max_depth,
         'workers': worker_count,
     }
-
 
 # %% [markdown]
 # #### Testing Functions
