@@ -778,6 +778,14 @@ def calculate_cumulative_volume_dicts(box_list):                                
         
     return cumulative_volume_dict, volume_to_go_dict
 
+def get_core_counts_list(mp_core_max):
+    i = 2
+    core_counts = []
+    while i <= mp_core_max:
+        core_counts += [i]
+        i = i *2
+    return core_counts
+
 def _bnb_mc_init_worker(pallet_dims, sorted_box_list, use_guarantee,
                         num_extpts_to_try, box_orientations_dict,
                         tallest_remaining_orientations, dimension_tuples,
@@ -1061,13 +1069,166 @@ def _bnb_mc_search_task(task):
     recursive_place(box_index)
     return task_index, best_sequence, best_score, counts
 
-def get_core_counts_list(mp_core_max):
-    i = 2
-    core_counts = []
-    while i <= mp_core_max:
-        core_counts += [i]
-        i = i *2
-    return core_counts
+def _bnb_speed_test_worker(conn, order_id, cores, box_list, criterion, metric, bnb_topx):
+    """Isolated process worker for a single (order, core_count) benchmark run.
+    
+    Bypasses GIL for 1-core runs and safely manages nested ProcessPoolExecutors
+    for multi-core runs. Results are passed back through an OS pipe.
+    """
+    try:
+        pallet = Pallet()
+        start_time = time.perf_counter()
+
+        if cores == 1:
+            stats = place_box_list_branch_and_bound(
+                pallet,
+                box_list,
+                criterion=criterion,
+                leave_tqdm=False,
+                optimality_guarantee=False,
+                num_extpts_to_try=bnb_topx,
+            )
+        else:
+            stats = place_box_list_branch_and_bound_mc(
+                pallet,
+                box_list,
+                criterion=criterion,
+                leave_tqdm=False,
+                optimality_guarantee=False,
+                num_extpts_to_try=bnb_topx,
+                cores=cores,
+            )
+
+        elapsed_seconds = time.perf_counter() - start_time
+
+        # Extract metric value matching run_bnb_mc_speed_comparison
+        if metric == Metric.MAX_Z:
+            metric_val = pallet.get_max_height()
+        elif metric == Metric.PACKING_SCORE:
+            metric_val = pallet.get_packing_score()
+        elif metric == Metric.VOLUME_UTILIZATION:
+            metric_val = pallet.get_volume_utilization()
+        elif metric == Metric.COG_Z:
+            metric_val = pallet.get_center_of_gravity_z()
+        else:
+            metric_val = None
+
+        canonical_boxes = sorted(
+            (b['x'], b['y'], b['z'], b['dx'], b['dy'], b['dz'])
+            for b in pallet.boxes
+        )
+
+        conn.send({
+            'order_id': order_id,
+            'cores': cores,
+            'seconds': elapsed_seconds,
+            'metric_value': metric_val,
+            'max_z': pallet.get_max_height(),
+            'box_count': len(pallet.boxes),
+            'stats': stats,
+            'canonical_boxes': canonical_boxes,
+            'heightmap': pallet.heightmap.copy(),
+            'error': None,
+        })
+    except Exception as e:
+        import traceback
+        conn.send({
+            'order_id': order_id,
+            'cores': cores,
+            'error': str(e),
+            'traceback': traceback.format_exc(),
+        })
+    finally:
+        conn.close()
+
+def _save_order_speed_comparison_csv( order_id, prefix, metric, all_core_counts, results_map, output_dir):
+    """Collates serial and multi-core results for one order and writes its CSV."""
+    serial_res = results_map[1]
+    serial_pallet_boxes = serial_res['canonical_boxes']
+    serial_heightmap = serial_res['heightmap']
+    serial_max_z = serial_res['max_z']
+    serial_seconds = serial_res['seconds']
+    serial_stats = serial_res['stats']
+
+    rows = []
+    # Serial row
+    rows.append({
+        'order_id': order_id,
+        'order_label': f"{prefix}{order_id}",
+        'implementation': 'single_core',
+        'cores': 1,
+        'seconds': serial_seconds,
+        'speedup_vs_single_core': 1.0,
+        'metric': metric.value,
+        'metric_value': serial_res['metric_value'],
+        'max_z': serial_max_z,
+        'box_count': serial_res['box_count'],
+        'nodes': serial_stats['nodes'],
+        'pruned_rule1': serial_stats['pruned_rule1'],
+        'pruned_rule4': serial_stats['pruned_rule4'],
+        'pruned_filt1': serial_stats['pruned_filt1'],
+        'pruned_filt2': serial_stats['pruned_filt2'],
+        'pruned_filt5': serial_stats['pruned_filt5'],
+        'matches_single_core': True,
+        'boxes_match': True,
+        'heightmap_match': True,
+        'max_z_match': True,
+    })
+
+    all_matches = True
+    speedup_summary = []
+
+    # Multi-core rows (ordered by core count: 2, 4, 8, ...)
+    for cores in sorted(c for c in all_core_counts if c > 1):
+        mc_res = results_map[cores]
+        mc_seconds = mc_res['seconds']
+        mc_stats = mc_res['stats']
+
+        boxes_match = (mc_res['canonical_boxes'] == serial_pallet_boxes)
+        heightmap_match = np.array_equal(mc_res['heightmap'], serial_heightmap)
+        max_z_match = (mc_res['max_z'] == serial_max_z)
+        pallets_match = bool(boxes_match and heightmap_match and max_z_match)
+
+        if not pallets_match:
+            all_matches = False
+
+        speedup = serial_seconds / mc_seconds if mc_seconds > 0 else math.inf
+        speedup_summary.append(f"MP{cores}:{speedup:.1f}x")
+
+        rows.append({
+            'order_id': order_id,
+            'order_label': f"{prefix}{order_id}",
+            'implementation': 'multi_core',
+            'cores': cores,
+            'seconds': mc_seconds,
+            'speedup_vs_single_core': speedup,
+            'metric': metric.value,
+            'metric_value': mc_res['metric_value'],
+            'max_z': mc_res['max_z'],
+            'box_count': mc_res['box_count'],
+            'nodes': mc_stats['nodes'],
+            'pruned_rule1': mc_stats['pruned_rule1'],
+            'pruned_rule4': mc_stats['pruned_rule4'],
+            'pruned_filt1': mc_stats['pruned_filt1'],
+            'pruned_filt2': mc_stats['pruned_filt2'],
+            'pruned_filt5': mc_stats['pruned_filt5'],
+            'matches_single_core': pallets_match,
+            'boxes_match': boxes_match,
+            'heightmap_match': heightmap_match,
+            'max_z_match': max_z_match,
+        })
+
+    csv_path = os.path.join(output_dir, f"speed_comparison_{prefix}{order_id}.csv")
+    df = pd.DataFrame(rows)
+    df.to_csv(csv_path, index=False)
+
+    summary_str = " | ".join(speedup_summary[-3:])  # Show top 3 speedups
+    match_status = "OK" if all_matches else "MISMATCH!"
+    print(
+        f"[COMPLETED] Order {prefix}{order_id:<4} -> {csv_path} | "
+        f"Serial: {serial_seconds:6.2f}s | {summary_str} | Verified: {match_status}"
+    )
+
 
 # %% [markdown]
 # #### Box Placing Algorithms
@@ -1362,9 +1523,7 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
     }
     return bnb_stats
 
-def place_box_list_branch_and_bound_mc(pallet, box_list, criterion=DEFAULT_CRITERION,
-                                       leave_tqdm=True, optimality_guarantee=None,
-                                       num_extpts_to_try=None, cores=1):
+def place_box_list_branch_and_bound_mc(pallet, box_list, criterion=DEFAULT_CRITERION, leave_tqdm=False, optimality_guarantee=None, num_extpts_to_try=None, cores=1):
     """Multi-core BnB algorithm with dynamic bound sharing and balanced subtrees."""
     if not isinstance(cores, int) or isinstance(cores, bool) or cores < 1:
         raise ValueError("cores must be a positive integer")
@@ -1495,6 +1654,7 @@ def place_box_list_branch_and_bound_mc(pallet, box_list, criterion=DEFAULT_CRITE
         'task_depth': max_depth,
         'workers': worker_count,
     }
+
 
 # %% [markdown]
 # #### Testing Functions
@@ -2065,6 +2225,186 @@ def run_bnb_mc_speed_comparison(mp_core_max=DEFAULT_MP_CORES, start_order=1, end
     print(f"Detected multi-core pallet mismatches: {mismatch_count}")
     return results_df
 
+def run_smart_concurrent_bnb_mc_speed_comparison(order_list=None, mp_core_max=128, order_dict=None, criterion=DEFAULT_CRITERION, metric=Metric.MAX_Z, bnb_topx=BNB_TOPX_DEFAULT_LIMIT, output_dir="./results/speed_comparisons/test_orders", total_machine_cores=None, max_active_orders=16):
+    """Smartly schedules benchmark tasks across orders to maximize core occupancy.
+
+    Tests serial (1 core) and exponential multi-core counts (2, 4, ..., mp_core_max).
+    Outputs one CSV per completed order directly to `output_dir` and skips orders
+    that have already been completed in prior runs.
+    """
+    if order_list is None:
+        order_list = speed_missing_test_orders
+
+    if order_dict is None:
+        order_dict = test_orders_dict
+
+    prefix = "O" if order_dict == orders_dict else "T"
+    os.makedirs(output_dir, exist_ok=True)
+
+    if total_machine_cores is None:
+        total_machine_cores = os.cpu_count() or mp_core_max
+
+    all_test_core_counts = [1] + get_core_counts_list(mp_core_max)
+    all_test_core_counts_set = set(all_test_core_counts)
+
+    # 1. Skip already-completed orders
+    pending_orders = []
+    skipped_count = 0
+    for oid in order_list:
+        csv_filename = os.path.join(output_dir, f"speed_comparison_{prefix}{oid}.csv")
+        if os.path.exists(csv_filename):
+            skipped_count += 1
+        else:
+            pending_orders.append(oid)
+
+    print("=" * 100)
+    print(f"SMART BnB MULTI-CORE BENCHMARK ORCHESTRATOR")
+    print(f"Machine Core Capacity : {total_machine_cores} cores")
+    print(f"Core Counts per Order : {all_test_core_counts}")
+    print(f"Total Orders Given    : {len(order_list)}")
+    print(f"Already Completed     : {skipped_count} (skipped)")
+    print(f"Remaining to Process  : {len(pending_orders)}")
+    print(f"Results Directory     : {output_dir}")
+    print("=" * 100)
+
+    if not pending_orders:
+        print("All target orders already have results in the output directory. Done!")
+        return
+
+    # Tracking structures
+    active_orders = set()
+    uncompleted_tasks = {}   # order_id -> set(cores_still_needed)
+    running_tasks = {}       # order_id -> set(cores_currently_running)
+    order_results = {}       # order_id -> {cores: result_dict}
+    active_processes = {}    # proc -> (conn, order_id, cores, start_time)
+
+    ctx = mp.get_context("fork" if "fork" in mp.get_all_start_methods() else None)
+
+    def launch_task(order_id, cores_to_run):
+        box_list = get_box_list_from_order(order_id, order_dict)
+        parent_conn, child_conn = ctx.Pipe(duplex=False)
+        proc = ctx.Process(
+            target=_bnb_speed_test_worker,
+            args=(
+                child_conn,
+                order_id,
+                cores_to_run,
+                box_list,
+                criterion,
+                metric,
+                bnb_topx,
+            ),
+            daemon=False,
+        )
+        proc.start()
+        child_conn.close()  # Close child end in parent so pipe EOF triggers cleanly
+        active_processes[proc] = (parent_conn, order_id, cores_to_run, time.time())
+        running_tasks[order_id].add(cores_to_run)
+
+    # Main scheduling event loop
+    while active_processes or pending_orders or active_orders:
+        # A. Check and reap finished processes
+        finished_procs = []
+        for proc, (conn, oid, cores_run, start_t) in list(active_processes.items()):
+            if conn.poll():
+                res = conn.recv()
+                proc.join()
+                conn.close()
+                finished_procs.append(proc)
+
+                running_tasks[oid].discard(cores_run)
+                uncompleted_tasks[oid].discard(cores_run)
+
+                if res.get('error'):
+                    print(f"\n[ERROR] Task ({prefix}{oid}, {cores_run} cores) failed:\n{res['traceback']}")
+                else:
+                    order_results[oid][cores_run] = res
+
+                # Check if this order has completed ALL core count benchmarks
+                if len(order_results[oid]) == len(all_test_core_counts):
+                    # Write out individual CSV
+                    _save_order_speed_comparison_csv(
+                        order_id=oid,
+                        prefix=prefix,
+                        metric=metric,
+                        all_core_counts=all_test_core_counts,
+                        results_map=order_results[oid],
+                        output_dir=output_dir,
+                    )
+                    # Clean up memory
+                    active_orders.discard(oid)
+                    del uncompleted_tasks[oid]
+                    del running_tasks[oid]
+                    del order_results[oid]
+
+            elif not proc.is_alive():
+                # Process died unexpectedly without sending data
+                proc.join()
+                conn.close()
+                finished_procs.append(proc)
+                running_tasks[oid].discard(cores_run)
+                print(f"\n[WARN] Worker for {prefix}{oid} ({cores_run} cores) exited prematurely. Re-queuing.")
+
+        for proc in finished_procs:
+            del active_processes[proc]
+
+        # B. Calculate current capacity
+        currently_used_cores = sum(c for (_, _, c, _) in active_processes.values())
+        free_cores = total_machine_cores - currently_used_cores
+
+        # C. Greedily pack work into free cores
+        work_dispatched = False
+        if free_cores > 0:
+            # Sort candidate powers of 2 descending: [128, 64, 32, ..., 1]
+            candidate_core_sizes = sorted(all_test_core_counts, reverse=True)
+
+            for c in candidate_core_sizes:
+                if c <= free_cores:
+                    # 1. Try to find an existing active order needing 'c' cores
+                    # Prioritize orders closest to completion
+                    selected_order = None
+                    sorted_active = sorted(
+                        active_orders,
+                        key=lambda o: len(order_results[o]),
+                        reverse=True,
+                    )
+                    for oid in sorted_active:
+                        if c in uncompleted_tasks[oid] and c not in running_tasks[oid]:
+                            selected_order = oid
+                            break
+
+                    # 2. If no active order needs 'c', admit a new order if:
+                    #    - we are below max_active_orders, OR
+                    #    - the existing active orders cannot utilize these free cores
+                    if selected_order is None and pending_orders:
+                        if len(active_orders) < max_active_orders or not any(
+                            any(core_req <= free_cores and core_req not in running_tasks[o]
+                                for core_req in uncompleted_tasks[o])
+                            for o in active_orders
+                        ):
+                            new_oid = pending_orders.pop(0)
+                            active_orders.add(new_oid)
+                            uncompleted_tasks[new_oid] = set(all_test_core_counts)
+                            running_tasks[new_oid] = set()
+                            order_results[new_oid] = {}
+                            selected_order = new_oid
+
+                    # Dispatch
+                    if selected_order is not None:
+                        launch_task(selected_order, c)
+                        free_cores -= c
+                        work_dispatched = True
+                        break  # Loop again to recompute free_cores and candidate sizes
+
+        # D. Small non-blocking sleep if idle/waiting to yield CPU
+        if not work_dispatched:
+            time.sleep(0.05)
+
+    print("\n" + "=" * 100)
+    print("All requested BnB speed comparisons finished successfully!")
+    print(f"Results are saved per-order in: {output_dir}")
+    print("=" * 100)
+
 
 # %% [markdown]
 # #### Testing Area
@@ -2081,7 +2421,8 @@ testing_random_fulfillment = False
 testing_optg_comparisons = False
 testing_topx_comparisons = False
 testing_algo_comparisons = False
-testing_speed_comparisons = True
+testing_speed_comparisons = False
+testing_smart_speed_comparisons = True
 
 given_order_list = list(range(1, 41))
 type_2_test_order_list = list(range(1000, 4000))
@@ -2099,6 +2440,8 @@ if __name__ == "__main__":
     if NOTEBOOK_MODE:
         if testing_speed_comparisons:
             run_bnb_mc_speed_comparison(DEFAULT_MP_CORES, 2000, 2099, test_orders_dict, DEFAULT_CRITERION, Metric.MAX_Z, False)
+        elif testing_smart_speed_comparisons:
+            run_smart_concurrent_bnb_mc_speed_comparison(speed_missing_test_orders, DEFAULT_MP_CORES, test_orders_dict, DEFAULT_CRITERION, Metric.MAX_Z, BNB_TOPX_DEFAULT_LIMIT, "./results/speed_comparisons/test_orders", DEFAULT_MP_CORES, 16)
         elif current_algo == Algorithm.BNB:
             testpallet, bnb_stats = process_order(current_orderID, algo=current_algo, criterion=current_criterion, order_dict=current_order_dict, metric=current_metric, num_extpts_to_try=current_nett)
             testpallet.get_pallet_results(current_algo, current_orderID, current_order_dict, print_mode=True, bnb_stats=bnb_stats)
@@ -2182,6 +2525,9 @@ if __name__ == "__main__":
 
     elif testing_speed_comparisons:
         run_bnb_mc_speed_comparison(DEFAULT_MP_CORES, 2500, 2599, test_orders_dict)
+
+    elif testing_smart_speed_comparisons:
+        run_smart_concurrent_bnb_mc_speed_comparison(speed_missing_test_orders, DEFAULT_MP_CORES, test_orders_dict, DEFAULT_CRITERION, Metric.MAX_Z, BNB_TOPX_DEFAULT_LIMIT, "./results/speed_comparisons/test_orders", DEFAULT_MP_CORES, 16)
     
     else:
         print("No workload specified. Exiting...")
