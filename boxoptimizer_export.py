@@ -2174,7 +2174,7 @@ if __name__ == "__main__":
                         )
 
     elif testing_speed_comparisons:
-        run_bnb_mc_speed_comparison(2, DEFAULT_MP_CORES, 8, 3200, 3299, test_orders_dict)
+        run_bnb_mc_speed_comparison(2, DEFAULT_MP_CORES, 8, 3200, 3210, test_orders_dict)
     
     else:
         print("No workload specified. Exiting...")
