@@ -1274,9 +1274,9 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
         seen_profile_keys = set() if not use_guarantee else None                                            # Filter 1 (Deduplication): Initialize set of unique seen profiles
 
         if dimension_tuples[box_index] == dimension_tuples[box_index - 1]:                                  # Filter 2 (Symmetry Breaking): Check if current box matches dimensions of previous box and record (dims, x, y) as comparison key
-            filt2_key = current_sequence[-1]
+            symmetry_key = current_sequence[-1]
         else:
-            filt2_key = None
+            symmetry_key = None
 
         candidate_placements = []                                                                           # Make list of valid placement candidates to loop through
         for dims in orientations:
@@ -1305,7 +1305,7 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
                     count_filt1 += 1
                     continue
 
-            if filt2_key is not None and filt2_key > (dims, x, y):                                          # Filter 2 (Symmetry Breaking): if a comparison key is registered and the candidate placement is smaller than the key (checked value by value in the tuples ((dx, dy, dz), x, y) ), prune branch as it would lead to an identical resultant pallet in terms of dimensions but with different boxes (of the same or different box IDs, like a type 8 or 10 box, which are dimensionally identical) occupying the same place.
+            if symmetry_key is not None and symmetry_key > (dims, x, y):                                    # Filter 2 (Symmetry Breaking): if a comparison key is registered and the candidate placement is smaller than the key (checked value by value in the tuples ((dx, dy, dz), x, y) ), prune branch as it would lead to an identical resultant pallet in terms of dimensions but with different boxes (of the same or different box IDs, like a type 8 or 10 box, which are dimensionally identical) occupying the same place.
                 counter_filt2.update(1)
                 count_filt2 += 1
                 continue
