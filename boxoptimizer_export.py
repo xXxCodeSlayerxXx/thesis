@@ -387,7 +387,10 @@ class Pallet:
             box_v = box['dx'] * box['dy'] * box['dz']
             occupied_volume += box_v
 
-        return round(occupied_volume / total_volume * 100, 2)
+        try:
+            return round(occupied_volume / total_volume * 100, 2)
+        except:
+            return 0
 
     def get_center_of_gravity_z(self):                                          # Return the height of the average position of box volume on the pallet (as a proxy for mass, which we have no data about)
         # Initialize accumulators for total box volume and the volume-height product
@@ -1057,6 +1060,14 @@ def _bnb_mc_search_task(task):
 
     recursive_place(box_index)
     return task_index, best_sequence, best_score, counts
+
+def get_core_counts_list(mp_core_max):
+    i = 2
+    core_counts = []
+    while i <= mp_core_max:
+        core_counts += [i]
+        i = i *2
+    return core_counts
 
 # %% [markdown]
 # #### Box Placing Algorithms
@@ -1828,7 +1839,7 @@ def run_algorithm_comparison_test(start_order=1, end_order=None, order_dict=test
     
     return results_df
 
-def run_bnb_mc_speed_comparison(mp_core_min=2, mp_core_max=DEFAULT_MP_CORES, mp_core_step=2, start_order=1, end_order=None, order_dict=test_orders_dict, criterion=DEFAULT_CRITERION, metric=Metric.MAX_Z, print_pallets=False, save_pallets=False, bnb_topx=BNB_TOPX_DEFAULT_LIMIT):
+def run_bnb_mc_speed_comparison(mp_core_max=DEFAULT_MP_CORES, start_order=1, end_order=None, order_dict=test_orders_dict, criterion=DEFAULT_CRITERION, metric=Metric.MAX_Z, print_pallets=False, save_pallets=False, bnb_topx=BNB_TOPX_DEFAULT_LIMIT):
     """Compare serial and multi-core BnB runtimes and verify identical pallets.
 
     One serial baseline is run per order, followed by one multi-core run for
@@ -1836,12 +1847,6 @@ def run_bnb_mc_speed_comparison(mp_core_min=2, mp_core_max=DEFAULT_MP_CORES, mp_
     order, and core count. Multi-core pallets are compared against the serial
     pallet using their canonical box placements, heightmap, and maximum height.
     """
-    if not isinstance(mp_core_min, int) or isinstance(mp_core_min, bool) or mp_core_min < 1:
-        raise ValueError("mp_core_min must be a positive integer")
-    if not isinstance(mp_core_max, int) or isinstance(mp_core_max, bool) or mp_core_max < mp_core_min:
-        raise ValueError("mp_core_max must be an integer greater than or equal to mp_core_min")
-    if not isinstance(mp_core_step, int) or isinstance(mp_core_step, bool) or mp_core_step < 1:
-        raise ValueError("mp_core_step must be a positive integer")
 
     if end_order is None:
         end_order = max(order_dict.keys())
@@ -1860,7 +1865,7 @@ def run_bnb_mc_speed_comparison(mp_core_min=2, mp_core_max=DEFAULT_MP_CORES, mp_
             f"No orders found from {start_order} through {end_order} in order_dict"
         )
 
-    core_counts = reversed(list(range(mp_core_min, mp_core_max + 1, mp_core_step)))
+    core_counts = get_core_counts_list(mp_core_max)
     result_rows = []
 
     def canonical_boxes(pallet_to_compare):
@@ -2048,7 +2053,7 @@ def run_bnb_mc_speed_comparison(mp_core_min=2, mp_core_max=DEFAULT_MP_CORES, mp_
     output_csv = (
         f"{output_dir}/speed_comparison_"
         f"{prefix}{start_order}_to_{prefix}{end_order}_"
-        f"MP{mp_core_min}-{mp_core_max}-{mp_core_step}.csv"
+        f"MP-2-{mp_core_max}.csv"
     )
     results_df = pd.DataFrame(result_rows)
     results_df.to_csv(output_csv, index=False)
@@ -2091,7 +2096,7 @@ algo_missing_test_orders = [3871, 3922, 3959]
 if __name__ == "__main__":
     if NOTEBOOK_MODE:
         if testing_speed_comparisons:
-            run_bnb_mc_speed_comparison(2, DEFAULT_MP_CORES, 2, 10, 25, test_orders_dict, DEFAULT_CRITERION, Metric.MAX_Z, False)
+            run_bnb_mc_speed_comparison(DEFAULT_MP_CORES, 2000, 2099, test_orders_dict, DEFAULT_CRITERION, Metric.MAX_Z, False)
         elif current_algo == Algorithm.BNB:
             testpallet, bnb_stats = process_order(current_orderID, algo=current_algo, criterion=current_criterion, order_dict=current_order_dict, metric=current_metric, num_extpts_to_try=current_nett)
             testpallet.get_pallet_results(current_algo, current_orderID, current_order_dict, print_mode=True, bnb_stats=bnb_stats)
@@ -2174,7 +2179,7 @@ if __name__ == "__main__":
                         )
 
     elif testing_speed_comparisons:
-        run_bnb_mc_speed_comparison(2, DEFAULT_MP_CORES, 8, 3200, 3210, test_orders_dict)
+        run_bnb_mc_speed_comparison(DEFAULT_MP_CORES, 2500, 2599, test_orders_dict)
     
     else:
         print("No workload specified. Exiting...")
