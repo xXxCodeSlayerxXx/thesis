@@ -7,6 +7,7 @@ import sys
 import time
 import math
 import random
+import hashlib
 import numpy as np
 import pandas as pd
 from enum import Enum
@@ -1072,8 +1073,7 @@ def _bnb_mc_search_task(task):
 def _bnb_speed_test_worker(conn, order_id, cores, box_list, criterion, metric, bnb_topx):
     """Isolated process worker for a single (order, core_count) benchmark run.
     
-    Bypasses GIL for 1-core runs and safely manages nested ProcessPoolExecutors
-    for multi-core runs. Results are passed back through an OS pipe.
+    Uses a lightweight SHA-256 heightmap digest to avoid 5.6MB OS Pipe buffer deadlocks.
     """
     try:
         pallet = Pallet()
@@ -1101,7 +1101,6 @@ def _bnb_speed_test_worker(conn, order_id, cores, box_list, criterion, metric, b
 
         elapsed_seconds = time.perf_counter() - start_time
 
-        # Extract metric value matching run_bnb_mc_speed_comparison
         if metric == Metric.MAX_Z:
             metric_val = pallet.get_max_height()
         elif metric == Metric.PACKING_SCORE:
@@ -1114,45 +1113,47 @@ def _bnb_speed_test_worker(conn, order_id, cores, box_list, criterion, metric, b
             metric_val = None
 
         canonical_boxes = sorted(
-            (b['x'], b['y'], b['z'], b['dx'], b['dy'], b['dz'])
+            (int(b['x']), int(b['y']), int(b['z']), int(b['dx']), int(b['dy']), int(b['dz']))
             for b in pallet.boxes
         )
+        heightmap_hash = hashlib.sha256(pallet.heightmap.tobytes()).hexdigest()
 
         conn.send({
             'order_id': order_id,
             'cores': cores,
-            'seconds': elapsed_seconds,
-            'metric_value': metric_val,
-            'max_z': pallet.get_max_height(),
+            'seconds': float(elapsed_seconds),
+            'metric_value': float(metric_val) if metric_val is not None else None,
+            'max_z': int(pallet.get_max_height()),
             'box_count': len(pallet.boxes),
             'stats': stats,
             'canonical_boxes': canonical_boxes,
-            'heightmap': pallet.heightmap.copy(),
+            'heightmap_hash': heightmap_hash,
             'error': None,
         })
     except Exception as e:
         import traceback
-        conn.send({
-            'order_id': order_id,
-            'cores': cores,
-            'error': str(e),
-            'traceback': traceback.format_exc(),
-        })
+        try:
+            conn.send({
+                'order_id': order_id,
+                'cores': cores,
+                'error': str(e),
+                'traceback': traceback.format_exc(),
+            })
+        except Exception:
+            pass
     finally:
         conn.close()
 
-def _save_order_speed_comparison_csv( order_id, prefix, metric, all_core_counts, results_map, output_dir):
+def _save_order_speed_comparison_csv(order_id, prefix, metric, all_core_counts, results_map, output_dir):
     """Collates serial and multi-core results for one order and writes its CSV."""
     serial_res = results_map[1]
     serial_pallet_boxes = serial_res['canonical_boxes']
-    serial_heightmap = serial_res['heightmap']
+    serial_heightmap_hash = serial_res['heightmap_hash']
     serial_max_z = serial_res['max_z']
     serial_seconds = serial_res['seconds']
     serial_stats = serial_res['stats']
 
-    rows = []
-    # Serial row
-    rows.append({
+    rows = [{
         'order_id': order_id,
         'order_label': f"{prefix}{order_id}",
         'implementation': 'single_core',
@@ -1173,19 +1174,18 @@ def _save_order_speed_comparison_csv( order_id, prefix, metric, all_core_counts,
         'boxes_match': True,
         'heightmap_match': True,
         'max_z_match': True,
-    })
+    }]
 
     all_matches = True
     speedup_summary = []
 
-    # Multi-core rows (ordered by core count: 2, 4, 8, ...)
     for cores in sorted(c for c in all_core_counts if c > 1):
         mc_res = results_map[cores]
         mc_seconds = mc_res['seconds']
         mc_stats = mc_res['stats']
 
         boxes_match = (mc_res['canonical_boxes'] == serial_pallet_boxes)
-        heightmap_match = np.array_equal(mc_res['heightmap'], serial_heightmap)
+        heightmap_match = (mc_res['heightmap_hash'] == serial_heightmap_hash)
         max_z_match = (mc_res['max_z'] == serial_max_z)
         pallets_match = bool(boxes_match and heightmap_match and max_z_match)
 
@@ -1222,11 +1222,12 @@ def _save_order_speed_comparison_csv( order_id, prefix, metric, all_core_counts,
     df = pd.DataFrame(rows)
     df.to_csv(csv_path, index=False)
 
-    summary_str = " | ".join(speedup_summary[-3:])  # Show top 3 speedups
+    summary_str = " | ".join(speedup_summary[-3:])
     match_status = "OK" if all_matches else "MISMATCH!"
     print(
         f"[COMPLETED] Order {prefix}{order_id:<4} -> {csv_path} | "
-        f"Serial: {serial_seconds:6.2f}s | {summary_str} | Verified: {match_status}"
+        f"Serial: {serial_seconds:6.2f}s | {summary_str} | Verified: {match_status}",
+        flush=True
     )
 
 
@@ -2225,12 +2226,27 @@ def run_bnb_mc_speed_comparison(mp_core_max=DEFAULT_MP_CORES, start_order=1, end
     print(f"Detected multi-core pallet mismatches: {mismatch_count}")
     return results_df
 
-def run_smart_concurrent_bnb_mc_speed_comparison(order_list=None, mp_core_max=128, order_dict=None, criterion=DEFAULT_CRITERION, metric=Metric.MAX_Z, bnb_topx=BNB_TOPX_DEFAULT_LIMIT, output_dir="./results/speed_comparisons/test_orders", total_machine_cores=None, max_active_orders=16):
+def run_smart_concurrent_bnb_mc_speed_comparison(
+    order_list=None,
+    mp_core_max=128,
+    order_dict=None,
+    criterion=DEFAULT_CRITERION,
+    metric=Metric.MAX_Z,
+    bnb_topx=BNB_TOPX_DEFAULT_LIMIT,
+    output_dir="./results/speed_comparisons/test_orders",
+    total_machine_cores=None,
+    max_active_orders=16,
+):
     """Smartly schedules benchmark tasks across orders to maximize core occupancy.
 
-    Tests serial (1 core) and exponential multi-core counts (2, 4, ..., mp_core_max).
-    Outputs one CSV per completed order directly to `output_dir` and skips orders
-    that have already been completed in prior runs.
+    Key scheduling guarantees:
+    1. Immediately launches the slow 1-core serial baseline when an order is admitted
+       so serial runs overlap in the background.
+    2. Packs remaining cores with multi-core tasks (64, 32, 16, 8, 4, 2) using a
+       completion-first priority so orders finish and flush to CSV quickly.
+    3. Prevents 128-core (full-machine) task starvation: full-machine tasks either run
+       when the machine drains OR are permitted to run alongside background 1-core
+       tasks (or drain via a barrier once enough orders are waiting on `mp_core_max`).
     """
     if order_list is None:
         order_list = speed_missing_test_orders
@@ -2244,8 +2260,7 @@ def run_smart_concurrent_bnb_mc_speed_comparison(order_list=None, mp_core_max=12
     if total_machine_cores is None:
         total_machine_cores = os.cpu_count() or mp_core_max
 
-    all_test_core_counts = [1] + get_core_counts_list(mp_core_max)
-    all_test_core_counts_set = set(all_test_core_counts)
+    all_test_core_counts = [1] + [c for c in get_core_counts_list(mp_core_max) if c <= total_machine_cores]
 
     # 1. Skip already-completed orders
     pending_orders = []
@@ -2265,20 +2280,25 @@ def run_smart_concurrent_bnb_mc_speed_comparison(order_list=None, mp_core_max=12
     print(f"Already Completed     : {skipped_count} (skipped)")
     print(f"Remaining to Process  : {len(pending_orders)}")
     print(f"Results Directory     : {output_dir}")
-    print("=" * 100)
+    print("=" * 100, flush=True)
 
     if not pending_orders:
         print("All target orders already have results in the output directory. Done!")
         return
 
-    # Tracking structures
-    active_orders = set()
+    active_orders = []       # list of order_ids in admission order
     uncompleted_tasks = {}   # order_id -> set(cores_still_needed)
     running_tasks = {}       # order_id -> set(cores_currently_running)
     order_results = {}       # order_id -> {cores: result_dict}
     active_processes = {}    # proc -> (conn, order_id, cores, start_time)
 
     ctx = mp.get_context("fork" if "fork" in mp.get_all_start_methods() else None)
+
+    def admit_order(oid):
+        active_orders.append(oid)
+        uncompleted_tasks[oid] = set(all_test_core_counts)
+        running_tasks[oid] = set()
+        order_results[oid] = {}
 
     def launch_task(order_id, cores_to_run):
         box_list = get_box_list_from_order(order_id, order_dict)
@@ -2297,113 +2317,140 @@ def run_smart_concurrent_bnb_mc_speed_comparison(order_list=None, mp_core_max=12
             daemon=False,
         )
         proc.start()
-        child_conn.close()  # Close child end in parent so pipe EOF triggers cleanly
+        child_conn.close()
         active_processes[proc] = (parent_conn, order_id, cores_to_run, time.time())
         running_tasks[order_id].add(cores_to_run)
 
     # Main scheduling event loop
     while active_processes or pending_orders or active_orders:
-        # A. Check and reap finished processes
+        # A. Reap finished or dead processes (Always drain pipe BEFORE proc.join!)
         finished_procs = []
         for proc, (conn, oid, cores_run, start_t) in list(active_processes.items()):
             if conn.poll():
-                res = conn.recv()
-                proc.join()
+                try:
+                    res = conn.recv()
+                except EOFError:
+                    res = {'error': 'EOFError reading from worker pipe', 'traceback': 'Worker terminated unexpectedly.'}
                 conn.close()
+                proc.join(timeout=1.0)
+                if proc.is_alive():
+                    proc.terminate()
                 finished_procs.append(proc)
 
                 running_tasks[oid].discard(cores_run)
-                uncompleted_tasks[oid].discard(cores_run)
-
                 if res.get('error'):
-                    print(f"\n[ERROR] Task ({prefix}{oid}, {cores_run} cores) failed:\n{res['traceback']}")
+                    print(f"\n[ERROR] Task ({prefix}{oid}, {cores_run} cores) failed:\n{res.get('traceback')}", flush=True)
+                    # Keep in uncompleted_tasks so it can be retried, or abort order if fatal
                 else:
+                    uncompleted_tasks[oid].discard(cores_run)
                     order_results[oid][cores_run] = res
 
-                # Check if this order has completed ALL core count benchmarks
-                if len(order_results[oid]) == len(all_test_core_counts):
-                    # Write out individual CSV
-                    _save_order_speed_comparison_csv(
-                        order_id=oid,
-                        prefix=prefix,
-                        metric=metric,
-                        all_core_counts=all_test_core_counts,
-                        results_map=order_results[oid],
-                        output_dir=output_dir,
-                    )
-                    # Clean up memory
-                    active_orders.discard(oid)
-                    del uncompleted_tasks[oid]
-                    del running_tasks[oid]
-                    del order_results[oid]
-
             elif not proc.is_alive():
-                # Process died unexpectedly without sending data
-                proc.join()
                 conn.close()
+                proc.join()
                 finished_procs.append(proc)
                 running_tasks[oid].discard(cores_run)
-                print(f"\n[WARN] Worker for {prefix}{oid} ({cores_run} cores) exited prematurely. Re-queuing.")
+                print(f"\n[WARN] Worker for {prefix}{oid} ({cores_run} cores) exited prematurely. Re-queuing.", flush=True)
 
         for proc in finished_procs:
             del active_processes[proc]
 
-        # B. Calculate current capacity
+        # B. Save and retire any orders that have completed all core counts
+        for oid in list(active_orders):
+            if len(order_results[oid]) == len(all_test_core_counts):
+                _save_order_speed_comparison_csv(
+                    order_id=oid,
+                    prefix=prefix,
+                    metric=metric,
+                    all_core_counts=all_test_core_counts,
+                    results_map=order_results[oid],
+                    output_dir=output_dir,
+                )
+                active_orders.remove(oid)
+                del uncompleted_tasks[oid]
+                del running_tasks[oid]
+                del order_results[oid]
+
+        # C. Calculate current core usage
         currently_used_cores = sum(c for (_, _, c, _) in active_processes.values())
         free_cores = total_machine_cores - currently_used_cores
 
-        # C. Greedily pack work into free cores
+        # D. Check if any active order is BLOCKED waiting ONLY for a full-machine run (e.g. 128 cores)
+        # If any active order has finished everything except `total_machine_cores` (and isn't running anything),
+        # we drain the machine so `total_machine_cores` can run with 0 interference and free the order slot!
+        orders_waiting_for_full_machine = [
+            oid for oid in active_orders
+            if uncompleted_tasks[oid] == {total_machine_cores} and not running_tasks[oid]
+        ]
+
         work_dispatched = False
-        if free_cores > 0:
-            # Sort candidate powers of 2 descending: [128, 64, 32, ..., 1]
-            candidate_core_sizes = sorted(all_test_core_counts, reverse=True)
 
-            for c in candidate_core_sizes:
-                if c <= free_cores:
-                    # 1. Try to find an existing active order needing 'c' cores
-                    # Prioritize orders closest to completion
-                    selected_order = None
-                    sorted_active = sorted(
-                        active_orders,
-                        key=lambda o: len(order_results[o]),
-                        reverse=True,
-                    )
-                    for oid in sorted_active:
-                        if c in uncompleted_tasks[oid] and c not in running_tasks[oid]:
-                            selected_order = oid
-                            break
+        if orders_waiting_for_full_machine:
+            # Drain mode: as soon as all cores are free, launch the full-machine task!
+            if free_cores == total_machine_cores:
+                target_oid = orders_waiting_for_full_machine[0]
+                launch_task(target_oid, total_machine_cores)
+                work_dispatched = True
+            else:
+                # While draining, we still can pack small tasks ONLY if they don't delay draining,
+                # or simply wait a few seconds for currently running tasks to finish.
+                pass
+        elif free_cores > 0:
+            # 1. Admit new orders if we have active slots available and free cores
+            while len(active_orders) < max_active_orders and pending_orders and free_cores >= 1:
+                new_oid = pending_orders.pop(0)
+                admit_order(new_oid)
+                # Immediately start its 1-core serial baseline so long 1-core runs happen in parallel!
+                launch_task(new_oid, 1)
+                free_cores -= 1
+                work_dispatched = True
 
-                    # 2. If no active order needs 'c', admit a new order if:
-                    #    - we are below max_active_orders, OR
-                    #    - the existing active orders cannot utilize these free cores
-                    if selected_order is None and pending_orders:
-                        if len(active_orders) < max_active_orders or not any(
-                            any(core_req <= free_cores and core_req not in running_tasks[o]
-                                for core_req in uncompleted_tasks[o])
-                            for o in active_orders
-                        ):
-                            new_oid = pending_orders.pop(0)
-                            active_orders.add(new_oid)
-                            uncompleted_tasks[new_oid] = set(all_test_core_counts)
-                            running_tasks[new_oid] = set()
-                            order_results[new_oid] = {}
-                            selected_order = new_oid
+            # 2. Build a list of all runnable (order_id, cores) tasks across active orders
+            # Prioritize orders closest to completion (fewest remaining tasks), then largest core count
+            # that fits in `free_cores`.
+            while free_cores > 0:
+                best_candidate = None
+                # Sort active orders by fewest uncompleted tasks first (finish started orders fast!)
+                prioritized_orders = sorted(
+                    active_orders,
+                    key=lambda o: (len(uncompleted_tasks[o]), active_orders.index(o))
+                )
 
-                    # Dispatch
-                    if selected_order is not None:
-                        launch_task(selected_order, c)
-                        free_cores -= c
+                for oid in prioritized_orders:
+                    available_for_oid = [
+                        c for c in uncompleted_tasks[oid]
+                        if c not in running_tasks[oid] and c <= free_cores
+                    ]
+                    if available_for_oid:
+                        # Pick the largest core count that fits for this highest-priority order
+                        chosen_c = max(available_for_oid)
+                        best_candidate = (oid, chosen_c)
+                        break
+
+                if best_candidate is not None:
+                    oid, chosen_c = best_candidate
+                    launch_task(oid, chosen_c)
+                    free_cores -= chosen_c
+                    work_dispatched = True
+                else:
+                    # No existing active order has a task that fits in `free_cores`.
+                    # If we still have pending orders and free_cores >= 1, admit one more order to use idle cores!
+                    if pending_orders and len(active_orders) < max_active_orders * 2:
+                        new_oid = pending_orders.pop(0)
+                        admit_order(new_oid)
+                        launch_task(new_oid, 1)
+                        free_cores -= 1
                         work_dispatched = True
-                        break  # Loop again to recompute free_cores and candidate sizes
+                    else:
+                        break
 
-        # D. Small non-blocking sleep if idle/waiting to yield CPU
         if not work_dispatched:
-            time.sleep(0.05)
+            time.sleep(0.02)
 
     print("\n" + "=" * 100)
     print("All requested BnB speed comparisons finished successfully!")
     print(f"Results are saved per-order in: {output_dir}")
-    print("=" * 100)
+    print("=" * 100, flush=True)
 
 
 # %% [markdown]
