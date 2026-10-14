@@ -2574,7 +2574,7 @@ if __name__ == "__main__":
         run_bnb_mc_speed_comparison(DEFAULT_MP_CORES, 2500, 2599, test_orders_dict)
 
     elif testing_smart_speed_comparisons:
-        run_smart_concurrent_bnb_mc_speed_comparison(speed_missing_test_orders, DEFAULT_MP_CORES, test_orders_dict, DEFAULT_CRITERION, Metric.MAX_Z, BNB_TOPX_DEFAULT_LIMIT, "./results/speed_comparisons/test_orders", DEFAULT_MP_CORES, 16)
+        run_smart_concurrent_bnb_mc_speed_comparison(speed_missing_test_orders, DEFAULT_MP_CORES, test_orders_dict, DEFAULT_CRITERION, Metric.MAX_Z, BNB_TOPX_DEFAULT_LIMIT, "./results/speed_comparisons/test_orders", DEFAULT_MP_CORES, 100)
     
     else:
         print("No workload specified. Exiting...")
