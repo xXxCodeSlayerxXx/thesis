@@ -5,6 +5,7 @@
 # All fans on maximum for duration of test
 # First tests done on Test Order 15 (15 boxes)
 # Second batch done on Test Order 25 (25 boxes)
+# Third batch done on Test Order 40 (40 boxes)
 
 "ADDITION"                                     , "TIME_TO_COMPLETE(min)", "(sec)", "NODES_COMPUTED", "AVG_NPS", BEST_SCORE, "PRUNED_RULE1", "PRUNED_RULE2", "PRUNED_RULE3", "PRUNED_RULE4", "PRUNED_DEDUP", "PRUNED_SYMBREAK", "PRUNED_HM_REC", "PRUNED_TS", "PRUNED_TX", NOTES
 
@@ -27,3 +28,5 @@
 "Two Surface filter deprecation"               , 23                     , 37     , 1766249         , 986      , 333       , 1591909       , 0             , 0             , 33057         , 3047645       , 1942589          , 0              , 0          ,            , "Back to baseline"
 "Top-X candidate limiting filter (5)"          , 5                      , 35     , 79388           , 303      , 333       , 36548         , 0             , 0             , 8069          , 29808         , 64584            , 0              , 0          , 1718254    , "The final form."
 "Major box height optimization"                , 0                      , 19     , 79388           , 21290    , 333       , 36548         , 0             , 0             , 8069          , 29808         , 64584            , 0              , 0          , 1718254    , "Incredible optimization."
+
+"Benchmark difficulty increase 2"              , 15                     , 10     , 5847728         , 7926     , 520       , 2342662       , 0             , 0             , 368875        , 1062112       , 8771225          , 0              , 0          , 159064448  , "We're conquering the largest orders in easily tractable timeframes now."

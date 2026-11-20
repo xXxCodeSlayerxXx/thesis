@@ -52,6 +52,7 @@ On the generated test set, BnB improved stack height over best-fit decreasing in
     ├── algo_comparisons/           Random / FFD / BFD / BnB
     ├── optg_comparisons/           BnB with vs without optimality guarantee
     ├── topx_comparisons/           BnB across top-X limits (1–15 and unlimited)
+    ├── spee_comparisons/           Single-core vs. multi-core BnB scaling & verification
     └── old_results/                Earlier experimental runs kept for provenance
 ```
 
@@ -89,11 +90,12 @@ All simulation is done in [`boxoptimizer.ipynb`](boxoptimizer.ipynb), along with
 
 ### `Pallet`
 
-A millimeter-resolution heightmap plus:
+A millimeter-resolution pallet model with a lazily materialized `int32` heightmap plus:
 
-- Incremental **place / undo** (`place_box` returns a delta; `remove_box` restores it) so BnB can backtrack without copying the pallet
+- **Exact $O(k)$ geometric placement queries** (`get_valid_placement_z`, `check_box_placement_validity`, `get_max_height_in_area`) over the placed box rectangles, computing landing height and exact supported footprint area in a single pass (falling back to the pixel heightmap if a custom heightmap is assigned)
+- **Incremental place / undo** (`place_box` returns a lightweight delta; `remove_box` restores `max_z` and extreme points in $O(1)$) so BnB can backtrack without copying the pallet or its 5.6 MB heightmap
 - **Extreme points** as the discrete candidate set (origin projections of box edges)
-- Placement validity: in-bounds, support percentage, no overlap
+- Placement validity: in-bounds, ≥ 70% support percentage, no overlap
 - Metrics and visualisation (2D heightmap, 3D bar plot, composite results figure)
 
 ### Metrics
@@ -130,13 +132,21 @@ A millimeter-resolution heightmap plus:
    - **Filter 2 (symmetry breaking):** for consecutive identical dimension triples, skip lexicographically smaller placements than the previous box.
 4. Reconstruct the pallet from the best placement sequence.
 
+### Multi-core branch and bound
+
+`place_box_list_branch_and_bound_mc(..., cores=P)` (enabled by default in `process_order(..., use_mp=True)`) parallelizes BnB across up to 128+ CPU cores while guaranteeing **bit-for-bit identical results** (placement sequence, heightmap, and `max_z`) to single-core `place_box_list_branch_and_bound`:
+
+- **Leftmost-first seeding & dynamic work splitting:** A small leftmost-first priority seed concentrates workers on the leftmost branch to tighten bounds early, while persistent workers maintain an explicit DFS stack and dynamically donate shallowest unexplored sibling subtrees whenever peer cores go idle (eliminating stragglers and upfront serial BFS bottlenecks).
+- **Low-overhead execution:** BLAS/OpenMP threads are pinned to 1 per process, workers reuse a single `Pallet` across tasks with longest-common-prefix (LCP) backtracking, and an event-driven coordinator (`multiprocessing.connection.wait`) dispatches tasks leftmost-first from a min-heap.
+- **Exact Rule-4 & tie-breaking equivalence:** Nodes carry lexicographic DFS path keys and ancestor Rule-4 spikes. Certified solutions (`max(ancestor Rule-4) <= final score`) are shared via a version-gated Pareto-front that unwinds doomed stack frames immediately without wrongly pruning earlier ties or non-monotonic Rule-4 branches; any rare uncertified candidate that beats or precedes the certified winner is resolved by an exact truncated prefix check.
+
 Deprecated experiments (volume bound, look-ahead bound, heightmap-hash filter, two-surface filter) are archived in [`bnb_structure_archive.txt`](bnb_structure_archive.txt). The measured effect of each addition and removal is in [`bnb_performance_metrics.csv`](bnb_performance_metrics.csv).
 
 ---
 
 ## Experiments
 
-Four experiment drivers live in the optimizer notebook/script. Analysis and figure generation live in [`data_processing.ipynb`](data_processing.ipynb).
+Six experiment drivers live in the optimizer notebook/script. Analysis and figure generation live in [`data_processing.ipynb`](data_processing.ipynb).
 
 | Function | What it measures | Output |
 |---|---|---|
@@ -144,6 +154,14 @@ Four experiment drivers live in the optimizer notebook/script. Analysis and figu
 | `run_optimality_guarantee_test` | Exact vs heuristic BnB (height and tree size) | `results/optg_comparisons/` |
 | `run_topx_limiting_test` | Top-X = 1…15 vs unlimited | `results/topx_comparisons/` |
 | `run_algorithm_comparison_test` | Random / FFD / BFD / BnB head-to-head | `results/algo_comparisons/` |
+| `run_bnb_mc_speed_comparison` | Sequential single-core vs. multi-core BnB scaling & exactness | `results/spee_comparisons/` |
+| `run_smart_concurrent_bnb_mc_speed_comparison` | Overnight multi-order scheduler targeting ~100% core use | `results/spee_comparisons/test_orders/` |
+
+The overnight smart scheduler (`run_smart_concurrent_bnb_mc_speed_comparison`) is built for shared high-core-count compute servers:
+
+- **Bounded WIP & finishing-first priority:** Limits concurrent in-flight orders (default `soft = ceil(cores / 8)`, `hard = ceil(cores / 4)`) and prioritizes orders closest to completion so CSVs flush steadily and early interruption wastes minimal partial work.
+- **Two-phase scheduling:** Runs full-machine benchmarks (`cores == total_machine_cores`, e.g. 128c) in exclusive bursts (briefly pausing active 1-core workers via `SIGSTOP`, which time via `time.process_time()`) and bin-packs sub-machine runs (`1, 2, ..., C/2`) with zero core oversubscription.
+- **Resumable & crash-safe:** Skips orders already saved as `spee_comparison_*.csv` or `speed_comparison_*.csv`, writes every CSV atomically via temp file + `os.replace`, and terminates worker process groups (`os.killpg`) on `SIGINT`/`SIGTERM` so no orphan processes remain.
 
 `data_processing.ipynb` also:
 
@@ -224,10 +242,13 @@ Defined near the top of the optimizer:
 | `SUPPORTED_AREA_PERCENTAGE` | `70` | Minimum supported footprint |
 | `HOR_ROTATION_ALLOWED_DEFAULT` / `VER_ROTATION_ALLOWED_DEFAULT` | `True` | Allowed orientations |
 | `DEFAULT_MAX_ATTEMPTS` | `2000` | Random placer attempt cap |
+| `DEFAULT_MP_CORES` | `max(2, os.cpu_count())` | Default core count for multi-core BnB and speed tests |
+| `BNB_MC_MIN_SPLIT_REMAINING` | `2` | Minimum remaining boxes required before donating a subtree |
+| `BNB_MC_MAX_DONATE_PER_SPLIT` | `8` | Maximum sibling tasks donated per work-splitting burst |
 
 ### Batch experiments
 
-Flags in the testing cell (`testing_random_fulfillment`, `testing_optg_comparisons`, `testing_topx_comparisons`, `testing_algo_comparisons`) run the corresponding driver. The comparison tests can be dispatched with `ProcessPoolExecutor` over missing order IDs.
+Flags in the testing cell (`testing_random_fulfillment`, `testing_optg_comparisons`, `testing_topx_comparisons`, `testing_algo_comparisons`, `testing_speed_comparisons`, `testing_smart_speed_comparisons`) run the corresponding driver. The comparison tests can be dispatched with `ProcessPoolExecutor` over missing order IDs, while `testing_smart_speed_comparisons` uses `run_smart_concurrent_bnb_mc_speed_comparison` to run missing orders overnight across all power-of-two core counts.
 
 After a batch, run the concatenation / missing-order / plotting cells in `data_processing.ipynb`.
 
