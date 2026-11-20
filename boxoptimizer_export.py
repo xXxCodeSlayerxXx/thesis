@@ -4,6 +4,7 @@
 # %%
 # Pin BLAS/OpenMP thread pools to 1 before importing NumPy so spawning up to
 # 128 Python worker processes never causes internal thread oversubscription.
+import os
 for _blas_env_var in (
     "OMP_NUM_THREADS",
     "OPENBLAS_NUM_THREADS",
@@ -13,7 +14,6 @@ for _blas_env_var in (
 ):
     os.environ.setdefault(_blas_env_var, "1")
 
-import os
 import sys
 import time
 import math
@@ -3517,11 +3517,12 @@ def run_smart_concurrent_bnb_mc_speed_comparison(
 
 # %%
 current_order_dict = test_orders_dict
-current_orderID = 15
+current_orderID = 25
 current_algo = Algorithm.BNB
 current_criterion = Criterion.VOLUME
 current_metric = Metric.MAX_Z
 current_nett = BNB_TOPX_DEFAULT_LIMIT
+use_mp = False
 
 testing_random_fulfillment = False
 testing_optg_comparisons = False
@@ -3559,7 +3560,7 @@ if __name__ == "__main__":
                 max_active_orders=None,
             )
         elif current_algo == Algorithm.BNB:
-            testpallet, bnb_stats = process_order(current_orderID, algo=current_algo, criterion=current_criterion, order_dict=current_order_dict, metric=current_metric, num_extpts_to_try=current_nett)
+            testpallet, bnb_stats = process_order(current_orderID, algo=current_algo, criterion=current_criterion, order_dict=current_order_dict, metric=current_metric, num_extpts_to_try=current_nett, use_mp=use_mp)
             testpallet.get_pallet_results(current_algo, current_orderID, current_order_dict, print_mode=True, bnb_stats=bnb_stats)
         else:
             testpallet, nodes = process_order(current_orderID, algo=current_algo, criterion=current_criterion, order_dict=current_order_dict, metric=current_metric)
