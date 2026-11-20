@@ -2,19 +2,33 @@
 # #### Imports
 
 # %%
+# Pin BLAS/OpenMP thread pools to 1 before importing NumPy so spawning up to
+# 128 Python worker processes never causes internal thread oversubscription.
+for _blas_env_var in (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+):
+    os.environ.setdefault(_blas_env_var, "1")
+
 import os
 import sys
 import time
 import math
+import heapq
 import random
 import signal
 import hashlib
+import traceback
 import numpy as np
 import pandas as pd
 from enum import Enum
 import concurrent.futures
 import multiprocessing as mp
 import matplotlib.pyplot as plt
+from multiprocessing.connection import wait as mp_wait
 
 NOTEBOOK_MODE = hasattr(sys, 'ps1')                                             # Detect whether diplay modules are to be loaded for notebook or terminal running (trick from https://stackoverflow.com/questions/1212779/detecting-when-a-python-script-is-being-run-interactively-in-ipython)
 if NOTEBOOK_MODE:
@@ -48,10 +62,7 @@ class Algorithm(Enum):                                                          
     BFD = "bfd"
     BNB = "bnb"
 
-_BNB_MC_STATE = None
-_SHARED_BEST_SCORE = None
-_SHARED_SOURCE_TASK = None
-_SHARED_LOCK = None                                                           # Instantiate state for multicore branch and bound
+_BNB_MC_CONTEXT = None                                                          # Read-only context inherited copy-on-write by forked BnB workers
 
 MAXIMIZE_METRICS = [Metric.PACKING_SCORE, Metric.VOLUME_UTILIZATION]            # Define which metrics should be maximized vs minimized (higher is better vs lower is better)
 MINIMIZE_METRICS = [Metric.COG_Z, Metric.MAX_Z]
@@ -71,7 +82,8 @@ BNB_OPTIMALITY_GUARANTEE        = False                                         
 DEFAULT_MAX_ATTEMPTS            = 2000                                          # Default cutoff for random attempts to place boxes
 SUPPORTED_AREA_PERCENTAGE       = 70                                            # Percentage of pallet area that must be supported under a box for it to be placed
 BNB_TOPX_DEFAULT_LIMIT          = 5                                             # Default limit amount for BnB Filter 5
-BNB_MC_TASK_OVERSUBSCRIPTION    = 8                                             # Multi-core BnB: generate this many tasks per requested core, so uneven subtree sizes get load-balanced across workers instead of leaving idle cores
+BNB_MC_MIN_SPLIT_REMAINING      = 2                                             # Multi-core BnB: only donate subtrees with at least this many boxes left to place
+BNB_MC_MAX_DONATE_PER_SPLIT     = 8                                             # Multi-core BnB: maximum sibling tasks donated in a single work-splitting burst
 
 # %% [markdown]
 # #### Data loading and precomputing
@@ -788,68 +800,120 @@ def get_core_counts_list(mp_core_max):
         i = i *2
     return core_counts
 
-def _bnb_mc_init_worker(pallet_dims, sorted_box_list, use_guarantee,
-                        num_extpts_to_try, box_orientations_dict,
-                        tallest_remaining_orientations, dimension_tuples,
-                        initial_best_score, shared_best_score,
-                        shared_source_task, shared_lock):
-    global _BNB_MC_STATE, _SHARED_BEST_SCORE, _SHARED_SOURCE_TASK, _SHARED_LOCK
-    _BNB_MC_STATE = (
-        pallet_dims,
-        sorted_box_list,
-        use_guarantee,
-        num_extpts_to_try,
-        box_orientations_dict,
-        tallest_remaining_orientations,
-        dimension_tuples,
-        initial_best_score,
-    )
-    _SHARED_BEST_SCORE = shared_best_score
-    _SHARED_SOURCE_TASK = shared_source_task
-    _SHARED_LOCK = shared_lock
-
-def _bnb_mc_zero_counts():
+def _bnb_zero_counts():
     return {
-        'nodes': 0, 'pruned_rule1': 0, 'pruned_rule4': 0,
-        'pruned_filt1': 0, 'pruned_filt2': 0, 'pruned_filt5': 0,
+        'nodes': 0,
+        'pruned_rule1': 0,
+        'pruned_rule4': 0,
+        'pruned_filt1': 0,
+        'pruned_filt2': 0,
+        'pruned_filt5': 0,
     }
 
-def _bnb_expand_single_node(pallet, box_index, sequence, sorted_box_list,
-                            use_guarantee, num_extpts_to_try,
-                            box_orientations_dict, tallest_remaining_orientations,
-                            dimension_tuples, best_score, counts):
-    """Expand one node. Mutates `pallet` during expansion but restores it on exit."""
-    n_boxes = len(sorted_box_list)
-    if box_index >= n_boxes:
-        return []
+def _bnb_merge_cert_front(cert_front, path_key, score, initial_best_score):
+    """Insert a certified (path_key, score) into the Pareto-front.
 
-    # Rule 1 (Trivial Bounding)
-    if pallet.get_max_height() >= best_score:
-        counts['pruned_rule1'] += 1
-        return []
+    Invariant: `cert_front` is a list of `(path_key, score)` tuples strictly
+    increasing in `path_key` and strictly decreasing in `score`, all with
+    `score < initial_best_score`.
+    Returns `(updated_front, changed)`.
+    """
+    if score >= initial_best_score:
+        return cert_front, False
 
-    # Rule 4 (Tall-Low Bounding)
-    t_orientations = tallest_remaining_orientations[box_index]
+    for p, s in cert_front:
+        if p <= path_key and s <= score:
+            return cert_front, False
+        if p > path_key:
+            break
+
+    new_front = []
+    inserted = False
+    for p, s in cert_front:
+        if p >= path_key and s >= score:
+            continue
+        if not inserted and p > path_key:
+            new_front.append((path_key, score))
+            inserted = True
+        new_front.append((p, s))
+    if not inserted:
+        new_front.append((path_key, score))
+    return new_front, True
+
+def _bnb_cert_front_limits(cert_front, current_path, initial_best_score):
+    """Compute exact sound (r1_limit, r4_limit) for a node at `current_path`.
+
+    - Rule 1 (max_z) is monotonic/admissible: any certified global best `g_score`
+      prunes with `g_score` to its right (`current_path > g_path`) and with
+      `g_score + 1` to its left (preserving earlier winning ties).
+    - Rule 4 (tall-low) is NOT monotonic across extreme-point changes: to never
+      prune a solution that single-core DFS would reach, Rule 4 only uses
+      certified solutions strictly to the LEFT of `current_path`.
+    """
+    if not cert_front:
+        return initial_best_score, initial_best_score
+
+    g_path, g_score = cert_front[-1]
+    if current_path > g_path:
+        return g_score, g_score
+
+    r1_limit = g_score + 1
+    r4_limit = initial_best_score
+    for p, s in cert_front:
+        if p < current_path:
+            r4_limit = s
+        else:
+            break
+    return r1_limit, r4_limit
+
+def _bnb_first_disproved_spike_depth(spikes, cert_front):
+    """Return the shallowest ancestor depth whose Rule-4 spike is disproved by `cert_front`, or None."""
+    if not spikes or not cert_front:
+        return None
+    for anc_path, anc_r4 in spikes:
+        for cp, cs in cert_front:
+            if cp < anc_path:
+                if cs <= anc_r4:
+                    return len(anc_path)
+            else:
+                break
+    return None
+
+def _bnb_spikes_disproved_by_front(spikes, cert_front):
+    """Return True iff `cert_front` already proves an ancestor spike was pruned by Rule 4."""
+    return _bnb_first_disproved_spike_depth(spikes, cert_front) is not None
+
+def _bnb_compute_rule4_min_z(pallet, tallest_orientations):
+    """Exact Rule 4 (tall-low) minimum landing height matching single-core BnB."""
     min_landing_z = pallet.size_z + 100
     for x, y in pallet.extpts:
-        for dims in t_orientations:
+        for dims in tallest_orientations:
             if pallet.check_box_placement_validity(dims, x, y):
                 landing_z = pallet.get_max_height_in_area(x, y, dims[0], dims[1])
-                min_landing_z = min(min_landing_z, landing_z + dims[2])
+                top_z = landing_z + dims[2]
+                if top_z < min_landing_z:
+                    min_landing_z = top_z
+    return min_landing_z
 
-    if pallet.size_z + 100 > min_landing_z >= best_score:
-        counts['pruned_rule4'] += 1
-        return []
+def _bnb_generate_valid_children(pallet, box_index, current_sequence,
+                                 sorted_box_list, use_guarantee,
+                                 num_extpts_to_try, box_orientations_dict,
+                                 dimension_tuples, counts):
+    """Generate ordered valid child placements for `box_index` (Filters 5, 1, 2).
 
+    Applies the exact same candidate generation, top-X sorting/slicing,
+    deduplication (Filter 1), and symmetry breaking (Filter 2) order as
+    `place_box_list_branch_and_bound()`, returning `[(child_idx, (dims, x, y)), ...]`.
+    """
     boxid = sorted_box_list[box_index]
     orientations = box_orientations_dict[boxid]
     sorted_extpts = sorted(pallet.extpts)
     seen_profile_keys = set() if not use_guarantee else None
 
     if box_index > 0 and dimension_tuples[box_index] == dimension_tuples[box_index - 1]:
-        filt2_key = sequence[-1]
+        symmetry_key = current_sequence[-1]
     else:
-        filt2_key = None
+        symmetry_key = None
 
     candidate_placements = []
     for dims in orientations:
@@ -857,231 +921,501 @@ def _bnb_expand_single_node(pallet, box_index, sequence, sorted_box_list,
             if pallet.check_box_placement_validity(dims, x, y):
                 landing_z = pallet.get_max_height_in_area(x, y, dims[0], dims[1])
                 top_z = landing_z + dims[2]
-                candidate_placements.append(((top_z, x + y), dims, x, y))
+                candidate_placements.append(((top_z, x + y), dims, x, y, landing_z))
 
     if not use_guarantee and num_extpts_to_try is not None:
         candidate_placements.sort(key=lambda c: c[0])
         filtered = max(0, len(candidate_placements) - num_extpts_to_try)
         candidate_placements = candidate_placements[:num_extpts_to_try]
-        counts['pruned_filt5'] += filtered
+        if filtered > 0:
+            counts['pruned_filt5'] += filtered
 
-    children = []
-    for _, dims, x, y in candidate_placements:
+    valid_children = []
+    child_idx = 0
+    for _, dims, x, y, landing_z in candidate_placements:
         if not use_guarantee:
-            z = pallet.get_max_height_in_area(x, y, dims[0], dims[1])
-            profile_key = (dims, z)
+            profile_key = (dims, landing_z)
             if profile_key in seen_profile_keys:
                 counts['pruned_filt1'] += 1
                 continue
 
-        if filt2_key is not None and filt2_key > (dims, x, y):
+        if symmetry_key is not None and symmetry_key > (dims, x, y):
             counts['pruned_filt2'] += 1
-            continue
-
-        delta = pallet.place_box(dims, x, y)
-        if not delta:
             continue
 
         if not use_guarantee:
             seen_profile_keys.add(profile_key)
 
-        counts['nodes'] += 1
-        children.append((box_index + 1, sequence + [(dims, x, y)]))
-        pallet.remove_box(delta)
+        valid_children.append((child_idx, (dims, x, y), int(landing_z + dims[2])))
+        child_idx += 1
 
-    return children
+    return valid_children
 
-def _bnb_mc_generate_frontier_tasks(pallet_dims, sorted_box_list, use_guarantee,
-                                     num_extpts_to_try, box_orientations_dict,
-                                     tallest_remaining_orientations, dimension_tuples,
-                                     initial_best_score, target_task_count):
-    """Uniform level-by-level breadth expansion.
-    
-    Expands full levels across all active branches to prevent jagged, unbalanced tasks.
-    Completed leaves are kept out of the worker queue.
-    """
-    counts = _bnb_mc_zero_counts()
-    best_score = initial_best_score
-    best_sequence = None
-    n_boxes = len(sorted_box_list)
+def _bnb_mc_worker_main(worker_id, worker_conn, shared_split_tokens,
+                        shared_split_lock, shared_bound_version, context_arg):
+    """Persistent worker process for dynamic work-splitting parallel BnB.
 
-    frontier = [(0, [])]
-    pallet = Pallet(dims=pallet_dims)
-    depth = 0
-
-    while len(frontier) < target_task_count and depth < n_boxes:
-        next_frontier = []
-        expanded_any = False
-
-        for b_idx, seq in frontier:
-            if b_idx == n_boxes:
-                next_frontier.append((b_idx, seq))
-                continue
-
-            pallet.reset()
-            for dims, x, y in seq:
-                pallet.place_box(dims, x, y)
-
-            children = _bnb_expand_single_node(
-                pallet, b_idx, seq, sorted_box_list, use_guarantee,
-                num_extpts_to_try, box_orientations_dict,
-                tallest_remaining_orientations, dimension_tuples,
-                best_score, counts
-            )
-
-            if children:
-                expanded_any = True
-                for child_b_idx, child_seq in children:
-                    if child_b_idx == n_boxes:
-                        pallet.reset()
-                        for d, x, y in child_seq:
-                            pallet.place_box(d, x, y)
-                        sc = pallet.get_max_height()
-                        if sc < best_score:
-                            best_score = sc
-                            best_sequence = list(child_seq)
-                    next_frontier.append((child_b_idx, child_seq))
-
-        if not expanded_any:
-            break
-
-        frontier = next_frontier
-        depth += 1
-
-    # Filter out completed leaves so workers only receive subtrees with real search work
-    active_frontier = [node for node in frontier if node[0] < n_boxes]
-    tasks = [(i, b_idx, seq) for i, (b_idx, seq) in enumerate(active_frontier)]
-    return tasks, counts, best_score, best_sequence, depth
-
-def _bnb_mc_search_task(task):
-    """Worker task search using dynamic shared-bound pruning."""
-    task_index, box_index, sequence = task
-    (pallet_dims, sorted_box_list, use_guarantee, num_extpts_to_try,
-     box_orientations_dict, tallest_remaining_orientations, dimension_tuples,
-     initial_best_score) = _BNB_MC_STATE
-
-    pallet = Pallet(dims=pallet_dims)
-    for dims, x, y in sequence:
-        delta = pallet.place_box(dims, x, y)
-        if not delta:
-            return task_index, None, initial_best_score, _bnb_mc_zero_counts()
-
-    current_sequence = list(sequence)
-    best_sequence = None
-    best_score = initial_best_score
-    counts = _bnb_mc_zero_counts()
-    n_boxes = len(sorted_box_list)
-
-    def recursive_place(b_idx):
-        nonlocal best_score, best_sequence
-
-        # Dynamic cross-process pruning bound
-        # Tasks to the right of the bound-owner prune with >= (cannot win ties);
-        # tasks to the left prune with > (preserves potential winning ties).
-        g_bound = _SHARED_BEST_SCORE.value
-        g_source = _SHARED_SOURCE_TASK.value
-        effective_limit = min(best_score, g_bound if task_index > g_source else g_bound + 1)
-
-        if b_idx == n_boxes:
-            current_score = pallet.get_max_height()
-            if current_score < best_score:
-                best_score = current_score
-                best_sequence = list(current_sequence)
-                with _SHARED_LOCK:
-                    if (current_score < _SHARED_BEST_SCORE.value or
-                        (current_score == _SHARED_BEST_SCORE.value and task_index < _SHARED_SOURCE_TASK.value)):
-                        _SHARED_BEST_SCORE.value = current_score
-                        _SHARED_SOURCE_TASK.value = task_index
-            return
-
-        # Rule 1
-        if pallet.get_max_height() >= effective_limit:
-            counts['pruned_rule1'] += 1
-            return
-
-        # Rule 4
-        t_orientations = tallest_remaining_orientations[b_idx]
-        min_landing_z = pallet.size_z + 100
-        for cx, cy in pallet.extpts:
-            for candidate_dims in t_orientations:
-                if pallet.check_box_placement_validity(candidate_dims, cx, cy):
-                    landing_z = pallet.get_max_height_in_area(cx, cy, candidate_dims[0], candidate_dims[1])
-                    min_landing_z = min(min_landing_z, landing_z + candidate_dims[2])
-
-        if pallet.size_z + 100 > min_landing_z >= effective_limit:
-            counts['pruned_rule4'] += 1
-            return
-
-        boxid = sorted_box_list[b_idx]
-        orientations = box_orientations_dict[boxid]
-        sorted_extpts = sorted(pallet.extpts)
-        seen_profile_keys = set() if not use_guarantee else None
-
-        if b_idx > 0 and dimension_tuples[b_idx] == dimension_tuples[b_idx - 1]:
-            filt2_key = current_sequence[-1]
-        else:
-            filt2_key = None
-
-        candidate_placements = []
-        for candidate_dims in orientations:
-            for cx, cy in sorted_extpts:
-                if pallet.check_box_placement_validity(candidate_dims, cx, cy):
-                    landing_z = pallet.get_max_height_in_area(cx, cy, candidate_dims[0], candidate_dims[1])
-                    top_z = landing_z + candidate_dims[2]
-                    candidate_placements.append(((top_z, cx + cy), candidate_dims, cx, cy))
-
-        if not use_guarantee and num_extpts_to_try is not None:
-            candidate_placements.sort(key=lambda c: c[0])
-            filtered = max(0, len(candidate_placements) - num_extpts_to_try)
-            candidate_placements = candidate_placements[:num_extpts_to_try]
-            counts['pruned_filt5'] += filtered
-
-        for _, candidate_dims, cx, cy in candidate_placements:
-            if not use_guarantee:
-                z = pallet.get_max_height_in_area(cx, cy, candidate_dims[0], candidate_dims[1])
-                profile_key = (candidate_dims, z)
-                if profile_key in seen_profile_keys:
-                    counts['pruned_filt1'] += 1
-                    continue
-
-            if filt2_key is not None and filt2_key > (candidate_dims, cx, cy):
-                counts['pruned_filt2'] += 1
-                continue
-
-            delta = pallet.place_box(candidate_dims, cx, cy)
-            if not delta:
-                continue
-
-            if not use_guarantee:
-                seen_profile_keys.add(profile_key)
-
-            current_sequence.append((candidate_dims, cx, cy))
-            counts['nodes'] += 1
-            recursive_place(b_idx + 1)
-            current_sequence.pop()
-            pallet.remove_box(delta)
-
-    # Initial check prior to entering subtree
-    init_bound = _SHARED_BEST_SCORE.value
-    init_source = _SHARED_SOURCE_TASK.value
-    init_limit = min(best_score, init_bound if task_index > init_source else init_bound + 1)
-    if pallet.get_max_height() >= init_limit:
-        return task_index, None, best_score, counts
-
-    recursive_place(box_index)
-    return task_index, best_sequence, best_score, counts
-
-def _bnb_speed_test_worker(conn, order_id, cores, box_list, criterion, metric, bnb_topx):
-    """Isolated process worker for a single (order, core_count) benchmark run.
-    
-    Uses time.process_time() for 1-core serial runs so brief SIGSTOP pauses during
-    128-core bursts have zero effect on serial benchmark timings.
-    Disables tqdm inside worker subprocesses to prevent terminal I/O contention.
+    Reuses a single Pallet instance across tasks with longest-common-prefix
+    incremental backtracking (eliminating repeated 5.6 MB heightmap allocations
+    and kernel TLB shootdowns across 128 cores) and uses an explicit DFS stack
+    so shallowest unexplored sibling subtrees can be donated on demand whenever
+    any peer core goes idle.
     """
     try:
-        # Silence tqdm progress bars inside background worker processes
+        ctx = context_arg if context_arg is not None else _BNB_MC_CONTEXT
+        (
+            pallet_dims,
+            sorted_box_list,
+            use_guarantee,
+            num_extpts_to_try,
+            box_orientations_dict,
+            tallest_remaining_orientations,
+            dimension_tuples,
+            initial_best_score,
+        ) = ctx
+
+        n_boxes = len(sorted_box_list)
+        size_z_plus_100 = pallet_dims[2] + 100
+        max_split_b_idx = n_boxes - BNB_MC_MIN_SPLIT_REMAINING
+
+        pallet = Pallet(dims=pallet_dims)
+        cur_seq = []
+        cur_deltas = []
+        counts = _bnb_zero_counts()
+
+        local_cert_front = []
+        local_bound_version = 0
+
+        def merge_front_updates(incoming_front):
+            nonlocal local_cert_front
+            for p, s in incoming_front:
+                local_cert_front, _ = _bnb_merge_cert_front(
+                    local_cert_front, p, s, initial_best_score
+                )
+
+        def poll_bounds():
+            nonlocal local_bound_version
+            v = shared_bound_version.value
+            if v != local_bound_version:
+                while worker_conn.poll():
+                    msg = worker_conn.recv()
+                    if msg[0] == "BOUND":
+                        merge_front_updates(msg[1])
+                        local_bound_version = msg[2]
+
+        def transition_pallet_to(target_seq):
+            """Move persistent `pallet` from `cur_seq` to `target_seq` via LCP."""
+            lcp = 0
+            limit = min(len(cur_seq), len(target_seq))
+            while lcp < limit and cur_seq[lcp] == target_seq[lcp]:
+                lcp += 1
+
+            while len(cur_seq) > lcp:
+                pallet.remove_box(cur_deltas.pop())
+                cur_seq.pop()
+
+            for move in target_seq[lcp:]:
+                dims, x, y = move
+                delta = pallet.place_box(dims, x, y)
+                if not delta:
+                    return False
+                cur_deltas.append(delta)
+                cur_seq.append(move)
+            return True
+
+        def search_subtree(root_path, root_seq, root_spikes):
+            nonlocal local_cert_front
+            if not transition_pallet_to(root_seq):
+                return
+
+            root_depth = len(root_seq)
+            if root_depth > 0:
+                counts['nodes'] += 1
+
+            spikes = list(root_spikes)
+
+            def enter_node(b_idx, cur_path):
+                nonlocal local_cert_front
+                poll_bounds()
+                r1_limit, r4_limit = _bnb_cert_front_limits(
+                    local_cert_front, cur_path, initial_best_score
+                )
+
+                # Base case: all boxes placed
+                if b_idx == n_boxes:
+                    sc = int(pallet.get_max_height())
+                    if sc < r1_limit:
+                        active_spikes = tuple(
+                            (ap, ar4) for ap, ar4 in spikes if ar4 > sc
+                        )
+                        if not active_spikes:
+                            local_cert_front, changed = _bnb_merge_cert_front(
+                                local_cert_front, cur_path, sc, initial_best_score
+                            )
+                            if changed:
+                                worker_conn.send(
+                                    ("SOLUTION", worker_id, True, cur_path, list(cur_seq), sc, ())
+                                )
+                        elif not _bnb_spikes_disproved_by_front(active_spikes, local_cert_front):
+                            worker_conn.send(
+                                ("SOLUTION", worker_id, False, cur_path, list(cur_seq), sc, active_spikes)
+                            )
+                    return None
+
+                # Rule 1 (Trivial Bounding)
+                cur_max_z = int(pallet.get_max_height())
+                if cur_max_z >= r1_limit:
+                    counts['pruned_rule1'] += 1
+                    return None
+
+                # Rule 4 (Tall-Low Bounding)
+                min_landing_z = int(_bnb_compute_rule4_min_z(
+                    pallet, tallest_remaining_orientations[b_idx]
+                ))
+                if size_z_plus_100 > min_landing_z >= r4_limit:
+                    counts['pruned_rule4'] += 1
+                    return None
+
+                pushed_spike = False
+                if size_z_plus_100 > min_landing_z > cur_max_z:
+                    spikes.append((cur_path, min_landing_z))
+                    pushed_spike = True
+
+                # Branching (Filters 5, 1, 2)
+                valid_children = _bnb_generate_valid_children(
+                    pallet,
+                    b_idx,
+                    cur_seq,
+                    sorted_box_list,
+                    use_guarantee,
+                    num_extpts_to_try,
+                    box_orientations_dict,
+                    dimension_tuples,
+                    counts,
+                )
+                if not valid_children:
+                    if pushed_spike:
+                        spikes.pop()
+                    return None
+
+                # Frame: [b_idx, path_key, valid_children, next_idx, pushed_spike, active_delta, base_max_z]
+                return [b_idx, cur_path, valid_children, 0, pushed_spike, None, cur_max_z]
+
+            first_frame = enter_node(root_depth, root_path)
+            if first_frame is None:
+                return
+
+            dfs_stack = [first_frame]
+
+            while dfs_stack:
+                # Poll incoming bound updates before splitting or expanding more siblings
+                poll_bounds()
+                top = dfs_stack[-1]
+
+                # Undo the child we just returned from
+                if top[5] is not None:
+                    pallet.remove_box(top[5])
+                    cur_deltas.pop()
+                    cur_seq.pop()
+                    top[5] = None
+
+                # Immediate stack unwinding ONLY down to the shallowest disproved
+                # spike depth (never discarding shallower sibling frames whose
+                # ancestors were not disproved!).
+                disproved_depth = _bnb_first_disproved_spike_depth(spikes, local_cert_front)
+                if disproved_depth is not None:
+                    while dfs_stack and dfs_stack[-1][0] >= disproved_depth:
+                        popped = dfs_stack.pop()
+                        if popped[5] is not None:
+                            pallet.remove_box(popped[5])
+                            cur_deltas.pop()
+                            cur_seq.pop()
+                        if popped[4]:
+                            spikes.pop()
+                    if not dfs_stack:
+                        break
+                    continue
+
+                top_r1_limit, _ = _bnb_cert_front_limits(
+                    local_cert_front, top[1], initial_best_score
+                )
+                if int(pallet.get_max_height()) >= top_r1_limit:
+                    dfs_stack.pop()
+                    if top[4]:
+                        spikes.pop()
+                    continue
+
+                # Dynamic top-of-stack work splitting when peer cores need work
+                if shared_split_tokens.value > 0:
+                    for frame in dfs_stack:
+                        f_depth = frame[0]
+                        if f_depth > max_split_b_idx:
+                            break
+                        f_children = frame[2]
+                        f_next = frame[3]
+                        f_active = frame[5] is not None
+                        start_idx = f_next if f_active else (f_next + 1)
+                        avail = len(f_children) - start_idx
+                        if avail <= 0:
+                            continue
+
+                        with shared_split_lock:
+                            tok = shared_split_tokens.value
+                            if tok > 0:
+                                n_donate = min(avail, tok, BNB_MC_MAX_DONATE_PER_SPLIT)
+                                shared_split_tokens.value = tok - n_donate
+                            else:
+                                n_donate = 0
+
+                        if n_donate > 0:
+                            donated_slice = f_children[start_idx : start_idx + n_donate]
+                            if f_active:
+                                frame[3] = start_idx + n_donate
+                            else:
+                                del f_children[start_idx : start_idx + n_donate]
+
+                            prefix_seq = cur_seq[:f_depth]
+                            prefix_spikes = tuple(
+                                (ap, ar4) for ap, ar4 in spikes if len(ap) <= f_depth
+                            )
+                            f_path = frame[1]
+                            f_base_max_z = frame[6]
+                            donated_tasks = [
+                                (
+                                    f_path + (orig_idx,),
+                                    prefix_seq + [move],
+                                    prefix_spikes,
+                                    max(f_base_max_z, child_top_z),
+                                )
+                                for orig_idx, move, child_top_z in donated_slice
+                            ]
+                            worker_conn.send(("DONATE", worker_id, donated_tasks))
+                        break
+
+                # Finished all children of `top` -> pop frame
+                if top[3] >= len(top[2]):
+                    dfs_stack.pop()
+                    if top[4]:
+                        spikes.pop()
+                    continue
+
+                # Descend into next child
+                orig_child_idx, move, child_top_z = top[2][top[3]]
+                top[3] += 1
+                next_path = top[1] + (orig_child_idx,)
+                child_r1_limit, _ = _bnb_cert_front_limits(
+                    local_cert_front, next_path, initial_best_score
+                )
+                # Fast Rule-1 pre-check before touching pallet heightmap
+                if max(top[6], child_top_z) >= child_r1_limit:
+                    counts['nodes'] += 1
+                    counts['pruned_rule1'] += 1
+                    continue
+
+                dims, x, y = move
+                delta = pallet.place_box(dims, x, y)
+                if not delta:
+                    continue
+
+                top[5] = delta
+                cur_deltas.append(delta)
+                cur_seq.append(move)
+                counts['nodes'] += 1
+
+                child_frame = enter_node(top[0] + 1, next_path)
+                if child_frame is not None:
+                    dfs_stack.append(child_frame)
+
+        # Main idle/task loop
+        while True:
+            msg = worker_conn.recv()
+            tag = msg[0]
+            if tag == "BOUND":
+                merge_front_updates(msg[1])
+                local_bound_version = msg[2]
+            elif tag == "TASK":
+                task_path, task_seq, task_spikes, _ = msg[1]
+                search_subtree(task_path, task_seq, task_spikes)
+                worker_conn.send(("DONE", worker_id))
+            elif tag == "STOP":
+                worker_conn.send(("FINAL_STATS", worker_id, counts))
+                break
+    except Exception:
+        try:
+            worker_conn.send(("ERROR", worker_id, traceback.format_exc()))
+        except Exception:
+            pass
+    finally:
+        try:
+            worker_conn.close()
+        except Exception:
+            pass
+
+def _bnb_mc_verify_anomalous_candidates(pallet_dims, sorted_box_list, use_guarantee,
+                                        num_extpts_to_try, box_orientations_dict,
+                                        tallest_remaining_orientations, dimension_tuples,
+                                        initial_best_score, best_cert_path, best_cert_seq,
+                                        best_cert_score, surviving_anomalies):
+    """Exact single-core prefix check for ultra-rare non-monotonic Rule-4 candidates.
+
+    Only invoked when a speculative worker found a solution whose path had an
+    ancestor Rule-4 spike (`r4 > final_score`) AND that candidate beats or ties
+    from the left the best certified solution without being disproved by
+    `cert_front`. Replays exact single-core DFS strictly up to the rightmost
+    unresolved candidate, terminating early as soon as all candidates are
+    disproved or resolved.
+    """
+    n_boxes = len(sorted_box_list)
+    size_z_plus_100 = pallet_dims[2] + 100
+    remaining = sorted(surviving_anomalies, key=lambda c: c[0])
+    max_target_path = remaining[-1][0]
+
+    pallet = Pallet(dims=pallet_dims)
+    cur_seq = []
+    dummy_counts = _bnb_zero_counts()
+    best_score = initial_best_score
+    best_seq = None
+    best_path = None
+    stop_early = False
+
+    def prune_targets(at_path):
+        nonlocal remaining, max_target_path, stop_early
+        kept = []
+        for cand in remaining:
+            cp, _, csc, cspikes = cand
+            if cp <= at_path:
+                continue
+            if csc >= best_score:
+                continue
+            if any(at_path < ap and best_score <= ar4 for ap, ar4 in cspikes):
+                continue
+            kept.append(cand)
+        remaining = kept
+        if not remaining:
+            stop_early = True
+        else:
+            max_target_path = remaining[-1][0]
+
+    def dfs(b_idx, cur_path):
+        nonlocal best_score, best_seq, best_path
+        if stop_early or cur_path > max_target_path:
+            return
+
+        if b_idx == n_boxes:
+            sc = int(pallet.get_max_height())
+            if sc < best_score:
+                best_score = sc
+                best_seq = list(cur_seq)
+                best_path = cur_path
+                prune_targets(cur_path)
+            return
+
+        if pallet.get_max_height() >= best_score:
+            return
+
+        min_landing_z = _bnb_compute_rule4_min_z(
+            pallet, tallest_remaining_orientations[b_idx]
+        )
+        if size_z_plus_100 > min_landing_z >= best_score:
+            return
+
+        valid_children = _bnb_generate_valid_children(
+            pallet, b_idx, cur_seq, sorted_box_list, use_guarantee,
+            num_extpts_to_try, box_orientations_dict, dimension_tuples,
+            dummy_counts,
+        )
+        for child_idx, (dims, x, y), _ in valid_children:
+            if stop_early:
+                return
+            next_path = cur_path + (child_idx,)
+            if next_path > max_target_path:
+                break
+            delta = pallet.place_box(dims, x, y)
+            if not delta:
+                continue
+            cur_seq.append((dims, x, y))
+            dfs(b_idx + 1, next_path)
+            cur_seq.pop()
+            pallet.remove_box(delta)
+
+    dfs(0, ())
+
+    if best_seq is not None and (
+        best_cert_seq is None
+        or best_score < best_cert_score
+        or (best_score == best_cert_score and best_path < best_cert_path)
+    ):
+        return best_seq, best_score
+    return best_cert_seq, best_cert_score
+
+def _extract_pallet_metric(pallet_to_measure, metric):
+    if metric == Metric.MAX_Z:
+        return pallet_to_measure.get_max_height()
+    if metric == Metric.PACKING_SCORE:
+        return pallet_to_measure.get_packing_score()
+    if metric == Metric.VOLUME_UTILIZATION:
+        return pallet_to_measure.get_volume_utilization()
+    if metric == Metric.COG_Z:
+        return pallet_to_measure.get_center_of_gravity_z()
+    if metric == Metric.ALL:
+        return None
+    raise ValueError(f"Unsupported metric: {metric}")
+
+def _canonical_boxes(pallet_to_compare):
+    return sorted(
+        (
+            int(b['x']), int(b['y']), int(b['z']),
+            int(b['dx']), int(b['dy']), int(b['dz']),
+        )
+        for b in pallet_to_compare.boxes
+    )
+
+def _write_csv_atomic(df, csv_path):
+    """Write a DataFrame to `csv_path` atomically via temp file + os.replace."""
+    parent_dir = os.path.dirname(csv_path)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
+    tmp_path = f"{csv_path}.tmp.{os.getpid()}"
+    try:
+        df.to_csv(tmp_path, index=False)
+        os.replace(tmp_path, csv_path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        raise
+
+def _find_existing_speed_csv(output_dir, prefix, order_id):
+    """Return existing non-empty speed-comparison CSV path for `order_id`, or None."""
+    for stem in ("spee_comparison", "speed_comparison"):
+        candidate = os.path.join(output_dir, f"{stem}_{prefix}{order_id}.csv")
+        if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
+            return candidate
+    return None
+
+def _bnb_speed_test_worker(conn, order_id, cores, box_list, criterion, metric,
+                           bnb_topx, optimality_guarantee=False):
+    """Isolated process worker for a single (order, core_count) benchmark run.
+
+    Creates its own POSIX process group so the scheduler can cleanly terminate
+    both this worker and any child multi-core pool processes on interruption
+    without leaving orphaned CPU-burning processes behind.
+
+    Uses `time.process_time()` for 1-core serial runs so brief SIGSTOP pauses
+    during exclusive full-machine multi-core bursts do not inflate serial
+    benchmark timings, and `time.perf_counter()` for multi-core runs (which are
+    never paused or oversubscribed).
+    """
+    try:
+        if hasattr(os, "setpgrp"):
+            try:
+                os.setpgrp()
+            except OSError:
+                pass
+
         os.environ["TQDM_DISABLE"] = "1"
-        
         pallet = Pallet()
 
         if cores == 1:
@@ -1091,7 +1425,7 @@ def _bnb_speed_test_worker(conn, order_id, cores, box_list, criterion, metric, b
                 box_list,
                 criterion=criterion,
                 leave_tqdm=False,
-                optimality_guarantee=False,
+                optimality_guarantee=optimality_guarantee,
                 num_extpts_to_try=bnb_topx,
             )
             elapsed_seconds = time.process_time() - start_time
@@ -1102,27 +1436,14 @@ def _bnb_speed_test_worker(conn, order_id, cores, box_list, criterion, metric, b
                 box_list,
                 criterion=criterion,
                 leave_tqdm=False,
-                optimality_guarantee=False,
+                optimality_guarantee=optimality_guarantee,
                 num_extpts_to_try=bnb_topx,
                 cores=cores,
             )
             elapsed_seconds = time.perf_counter() - start_time
 
-        if metric == Metric.MAX_Z:
-            metric_val = pallet.get_max_height()
-        elif metric == Metric.PACKING_SCORE:
-            metric_val = pallet.get_packing_score()
-        elif metric == Metric.VOLUME_UTILIZATION:
-            metric_val = pallet.get_volume_utilization()
-        elif metric == Metric.COG_Z:
-            metric_val = pallet.get_center_of_gravity_z()
-        else:
-            metric_val = None
-
-        canonical_boxes = sorted(
-            (int(b['x']), int(b['y']), int(b['z']), int(b['dx']), int(b['dy']), int(b['dz']))
-            for b in pallet.boxes
-        )
+        metric_val = _extract_pallet_metric(pallet, metric)
+        canonical_boxes = _canonical_boxes(pallet)
         heightmap_hash = hashlib.sha256(pallet.heightmap.tobytes()).hexdigest()
 
         conn.send({
@@ -1138,7 +1459,6 @@ def _bnb_speed_test_worker(conn, order_id, cores, box_list, criterion, metric, b
             'error': None,
         })
     except Exception as e:
-        import traceback
         try:
             conn.send({
                 'order_id': order_id,
@@ -1149,10 +1469,13 @@ def _bnb_speed_test_worker(conn, order_id, cores, box_list, criterion, metric, b
         except Exception:
             pass
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
 
-def _save_order_speed_comparison_csv(order_id, prefix, metric, all_core_counts, results_map, output_dir):
-    """Collates serial and multi-core results for one order and writes its CSV."""
+def _build_speed_comparison_rows(order_id, prefix, metric, all_core_counts, results_map):
+    """Build exact CSV row dicts comparing single-core and multi-core results."""
     serial_res = results_map[1]
     serial_pallet_boxes = serial_res['canonical_boxes']
     serial_heightmap_hash = serial_res['heightmap_hash']
@@ -1204,9 +1527,9 @@ def _save_order_speed_comparison_csv(order_id, prefix, metric, all_core_counts, 
 
         rows.append({
             'order_id': order_id,
-            'cores': cores,
             'order_label': f"{prefix}{order_id}",
             'implementation': 'multi_core',
+            'cores': cores,
             'seconds': mc_seconds,
             'speedup_vs_single_core': speedup,
             'metric': metric.value,
@@ -1225,17 +1548,26 @@ def _save_order_speed_comparison_csv(order_id, prefix, metric, all_core_counts, 
             'max_z_match': max_z_match,
         })
 
+    return rows, all_matches, speedup_summary
+
+def _save_order_speed_comparison_csv(order_id, prefix, metric, all_core_counts, results_map, output_dir):
+    """Collates serial and multi-core results for one order and atomically writes its CSV."""
+    rows, all_matches, speedup_summary = _build_speed_comparison_rows(
+        order_id, prefix, metric, all_core_counts, results_map
+    )
+    serial_seconds = results_map[1]['seconds']
     csv_path = os.path.join(output_dir, f"spee_comparison_{prefix}{order_id}.csv")
     df = pd.DataFrame(rows)
-    df.to_csv(csv_path, index=False)
+    _write_csv_atomic(df, csv_path)
 
     summary_str = " | ".join(speedup_summary[-3:])
     match_status = "OK" if all_matches else "MISMATCH!"
     print(
         f"[COMPLETED] Order {prefix}{order_id:<4} -> {csv_path} | "
         f"Serial: {serial_seconds:6.2f}s | {summary_str} | Verified: {match_status}",
-        flush=True
+        flush=True,
     )
+    return all_matches, csv_path
 
 # %% [markdown]
 # #### Box Placing Algorithms
@@ -1531,30 +1863,50 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
     return bnb_stats
 
 def place_box_list_branch_and_bound_mc(pallet, box_list, criterion=DEFAULT_CRITERION, leave_tqdm=False, optimality_guarantee=None, num_extpts_to_try=None, cores=1):
-    """Multi-core BnB algorithm with dynamic bound sharing and balanced subtrees."""
+    """Exact multi-core Branch-and-Bound with dynamic work splitting.
+
+    Guarantees results bit-for-bit identical to `place_box_list_branch_and_bound()`
+    (exact same placement sequence, heightmap, and max_z):
+      - Uses leftmost-first priority dispatch (`heapq` by DFS path key) and
+        on-demand top-of-stack dynamic work splitting across workers, avoiding
+        both upfront serial BFS bottlenecks and static-partition stragglers.
+      - Tracks certified solutions (`max(ancestor Rule-4) <= final score`) in a
+        shared Pareto-front so Rule 1 and Rule 4 never prune any branch that
+        single-core DFS would explore, and verifies any rare non-monotonic
+        Rule-4 candidate exactly before committing the final result.
+    """
+    global _BNB_MC_CONTEXT
+
     if not isinstance(cores, int) or isinstance(cores, bool) or cores < 1:
         raise ValueError("cores must be a positive integer")
 
-    if cores == 1 or not box_list:
+    if cores == 1 or len(box_list) <= 2:
         return place_box_list_branch_and_bound(
-            pallet, box_list, criterion=criterion, leave_tqdm=leave_tqdm,
+            pallet,
+            box_list,
+            criterion=criterion,
+            leave_tqdm=leave_tqdm,
             optimality_guarantee=optimality_guarantee,
             num_extpts_to_try=num_extpts_to_try,
         )
 
+    # 1. Prework & precalculations (identical to single-core BnB)
     sorted_box_list = sort_box_list_by_size(
         box_list, criterion=criterion, invert=False
     )
     use_guarantee = (
         BNB_OPTIMALITY_GUARANTEE
-        if optimality_guarantee is None else optimality_guarantee
+        if optimality_guarantee is None
+        else optimality_guarantee
     )
+    pallet_dims = (pallet.size_x, pallet.size_y, pallet.size_z)
+    n_boxes = len(sorted_box_list)
 
-    temp_pallet = Pallet(dims=(pallet.size_x, pallet.size_y, pallet.size_z))
+    temp_pallet = Pallet(dims=pallet_dims)
     place_box_list_best_fit_decreasing(
         temp_pallet, sorted_box_list, criterion=criterion
     )
-    initial_best_score = temp_pallet.get_max_height() + 1
+    initial_best_score = int(temp_pallet.get_max_height() + 1)
 
     box_orientations_dict = {}
     for boxid in set(sorted_box_list):
@@ -1562,10 +1914,10 @@ def place_box_list_branch_and_bound_mc(pallet, box_list, criterion=DEFAULT_CRITE
         box_orientations_dict[boxid] = get_box_orientations(dx, dy, dz)
 
     tallest_remaining_orientations = []
-    for i in range(len(sorted_box_list)):
+    for i in range(n_boxes):
         tallest_remaining_id = max(
             sorted_box_list[i:],
-            key=lambda bid: min(get_box_properties_from_id(bid)[:3])
+            key=lambda bid: min(get_box_properties_from_id(bid)[:3]),
         )
         tallest_remaining_orientations.append(
             box_orientations_dict[tallest_remaining_id]
@@ -1576,71 +1928,417 @@ def place_box_list_branch_and_bound_mc(pallet, box_list, criterion=DEFAULT_CRITE
         for boxid in sorted_box_list
     ]
 
-    target_task_count = max(cores * BNB_MC_TASK_OVERSUBSCRIPTION, 256)
-    pallet_dims = (pallet.size_x, pallet.size_y, pallet.size_z)
+    # 2. Fast leftmost-first seed expansion (capped at <= 64 expansions, ~0.01-0.3s):
+    #    Repeatedly expands ONLY the leftmost node in the priority heap so all
+    #    workers start concentrated inside the leftmost branch (discovering tight
+    #    bounds immediately instead of wasting cycles speculating on far-right
+    #    root siblings before the first incumbent is found). Reuses a single
+    #    Pallet with LCP backtracking (zero 5.6 MB allocations) and records full
+    #    Rule-4 spikes on every seed task so exactness is 100% preserved.
+    seed_counts = _bnb_zero_counts()
+    seed_pallet = Pallet(dims=pallet_dims)
+    seed_cur_seq = []
+    seed_cur_deltas = []
+    size_z_plus_100 = pallet_dims[2] + 100
 
-    (tasks, frontier_counts, frontier_best_score,
-     frontier_best_seq, max_depth) = _bnb_mc_generate_frontier_tasks(
-        pallet_dims, sorted_box_list, use_guarantee, num_extpts_to_try,
-        box_orientations_dict, tallest_remaining_orientations,
-        dimension_tuples, initial_best_score, target_task_count
-    )
+    cert_front = []
+    best_cert_path = None
+    best_cert_seq = None
+    best_cert_score = initial_best_score
+    anomalous_candidates = []
 
-    # Return immediately if search space resolved completely during frontier expansion
-    if len(tasks) == 0:
-        if frontier_best_seq:
-            for dims, x, y in frontier_best_seq:
+    def seed_transition_to(target_seq):
+        lcp = 0
+        limit = min(len(seed_cur_seq), len(target_seq))
+        while lcp < limit and seed_cur_seq[lcp] == target_seq[lcp]:
+            lcp += 1
+        while len(seed_cur_seq) > lcp:
+            seed_pallet.remove_box(seed_cur_deltas.pop())
+            seed_cur_seq.pop()
+        for move in target_seq[lcp:]:
+            dims, x, y = move
+            delta = seed_pallet.place_box(dims, x, y)
+            if not delta:
+                return False
+            seed_cur_deltas.append(delta)
+            seed_cur_seq.append(move)
+        return True
+
+    # Seed heap entries: (path_key, seq, spikes, min_max_z)
+    task_heap = [((), [], (), 0)]
+    target_seed_tasks = max(cores * 2, 8)
+    max_seed_expansions = min(64, max(cores, 4))
+    seed_expansions = 0
+    max_split_depth = 0
+
+    while task_heap and len(task_heap) < target_seed_tasks and seed_expansions < max_seed_expansions:
+        node_path, node_seq, node_spikes, node_min_max_z = heapq.heappop(task_heap)
+        if _bnb_spikes_disproved_by_front(node_spikes, cert_front):
+            continue
+        r1_limit, r4_limit = _bnb_cert_front_limits(
+            cert_front, node_path, initial_best_score
+        )
+        if node_min_max_z >= r1_limit:
+            if len(node_seq) > 0:
+                seed_counts['nodes'] += 1
+            seed_counts['pruned_rule1'] += 1
+            continue
+
+        if not seed_transition_to(node_seq):
+            continue
+
+        b_idx = len(node_seq)
+        if b_idx > 0:
+            seed_counts['nodes'] += 1
+
+        if b_idx == n_boxes:
+            sc = int(seed_pallet.get_max_height())
+            if sc < r1_limit:
+                active_spikes = tuple(
+                    (ap, ar4) for ap, ar4 in node_spikes if ar4 > sc
+                )
+                if not active_spikes:
+                    cert_front, changed = _bnb_merge_cert_front(
+                        cert_front, node_path, sc, initial_best_score
+                    )
+                    if changed and (
+                        best_cert_seq is None
+                        or sc < best_cert_score
+                        or (sc == best_cert_score and node_path < best_cert_path)
+                    ):
+                        best_cert_path = node_path
+                        best_cert_seq = list(node_seq)
+                        best_cert_score = sc
+                elif not _bnb_spikes_disproved_by_front(active_spikes, cert_front):
+                    anomalous_candidates.append((node_path, list(node_seq), sc, active_spikes))
+            continue
+
+        cur_max_z = int(seed_pallet.get_max_height())
+        if cur_max_z >= r1_limit:
+            seed_counts['pruned_rule1'] += 1
+            continue
+
+        min_landing_z = int(_bnb_compute_rule4_min_z(
+            seed_pallet, tallest_remaining_orientations[b_idx]
+        ))
+        if size_z_plus_100 > min_landing_z >= r4_limit:
+            seed_counts['pruned_rule4'] += 1
+            continue
+
+        child_spikes = node_spikes
+        if size_z_plus_100 > min_landing_z > cur_max_z:
+            child_spikes = node_spikes + ((node_path, min_landing_z),)
+
+        valid_children = _bnb_generate_valid_children(
+            seed_pallet, b_idx, seed_cur_seq, sorted_box_list, use_guarantee,
+            num_extpts_to_try, box_orientations_dict, dimension_tuples,
+            seed_counts,
+        )
+        seed_expansions += 1
+        if b_idx + 1 > max_split_depth:
+            max_split_depth = b_idx + 1
+
+        for orig_idx, move, child_top_z in valid_children:
+            child_min_max_z = max(cur_max_z, child_top_z)
+            heapq.heappush(
+                task_heap,
+                (node_path + (orig_idx,), node_seq + [move], child_spikes, child_min_max_z),
+            )
+
+    # Trivial / dead-end tree resolved completely during seed: no workers needed
+    if not task_heap:
+        surviving_anomalies = [
+            cand for cand in anomalous_candidates
+            if (
+                (
+                    best_cert_seq is None
+                    or cand[2] < best_cert_score
+                    or (cand[2] == best_cert_score and cand[0] < best_cert_path)
+                )
+                and not _bnb_spikes_disproved_by_front(cand[3], cert_front)
+            )
+        ]
+        if surviving_anomalies:
+            best_sequence, best_score = _bnb_mc_verify_anomalous_candidates(
+                pallet_dims, sorted_box_list, use_guarantee, num_extpts_to_try,
+                box_orientations_dict, tallest_remaining_orientations,
+                dimension_tuples, initial_best_score, best_cert_path,
+                best_cert_seq, best_cert_score, surviving_anomalies,
+            )
+        else:
+            best_sequence = best_cert_seq
+            best_score = best_cert_score
+
+        if best_sequence:
+            for dims, x, y in best_sequence:
                 pallet.place_box(dims, x, y)
+        else:
+            print("Branch and Bound failed. No valid placements found.")
         return {
-            'nodes': frontier_counts['nodes'],
-            'pruned_rule1': frontier_counts['pruned_rule1'],
-            'pruned_rule4': frontier_counts['pruned_rule4'],
-            'pruned_filt1': frontier_counts['pruned_filt1'],
-            'pruned_filt2': frontier_counts['pruned_filt2'],
-            'pruned_filt5': frontier_counts['pruned_filt5'],
-            'best_score': frontier_best_score,
+            'nodes': seed_counts['nodes'],
+            'pruned_rule1': seed_counts['pruned_rule1'],
+            'pruned_rule4': seed_counts['pruned_rule4'],
+            'pruned_filt1': seed_counts['pruned_filt1'],
+            'pruned_filt2': seed_counts['pruned_filt2'],
+            'pruned_filt5': seed_counts['pruned_filt5'],
+            'best_score': best_score,
             'optimality_guarantee': use_guarantee,
             'topx_limit': num_extpts_to_try,
-            'tasks': len(tasks),
-            'task_depth': max_depth,
+            'tasks': 0,
+            'task_depth': max_split_depth,
             'workers': 1,
         }
 
-    worker_count = min(cores, len(tasks))
+    # 3. Launch persistent worker pool & run event-driven dynamic work-splitting
+    use_fork = "fork" in mp.get_all_start_methods()
+    mp_ctx = mp.get_context("fork") if use_fork else mp.get_context()
 
-    # Shared cross-process state for dynamic pruning
-    shared_best_score = mp.RawValue('i', frontier_best_score)
-    shared_source_task = mp.RawValue('i', 9999999)
-    shared_lock = mp.Lock()
-
-    initializer_args = (
-        pallet_dims, sorted_box_list, use_guarantee, num_extpts_to_try,
-        box_orientations_dict, tallest_remaining_orientations,
-        dimension_tuples, frontier_best_score,
-        shared_best_score, shared_source_task, shared_lock,
+    context_tuple = (
+        pallet_dims,
+        sorted_box_list,
+        use_guarantee,
+        num_extpts_to_try,
+        box_orientations_dict,
+        tallest_remaining_orientations,
+        dimension_tuples,
+        initial_best_score,
     )
 
-    mp_context = mp.get_context("fork") if "fork" in mp.get_all_start_methods() else None
+    worker_count = cores
+    shared_split_tokens = mp_ctx.RawValue('i', 0)
+    shared_split_lock = mp_ctx.Lock()
+    shared_bound_version = mp_ctx.RawValue('i', 0)
 
-    with concurrent.futures.ProcessPoolExecutor(
-            max_workers=worker_count,
-            mp_context=mp_context,
-            initializer=_bnb_mc_init_worker,
-            initargs=initializer_args) as executor:
-        results = list(executor.map(_bnb_mc_search_task, tasks, chunksize=1))
+    bound_version = 0
 
-    results.sort(key=lambda result: result[0])
-    best_score = frontier_best_score
-    best_sequence = frontier_best_seq
-    totals = dict(frontier_counts)
+    totals = dict(seed_counts)
+    total_tasks_dispatched = 0
 
-    for _, sequence, score, counts in results:
-        for key in totals:
-            totals[key] += counts[key]
-        if sequence is not None and score < best_score:
-            best_score = score
-            best_sequence = sequence
+    workers = []
+    master_conns = {}
+    conn_to_wid = {}
+    idle_workers = []
+    busy_workers = set()
 
+    buffer_target = max(2, worker_count // 2)
+
+    def refresh_split_tokens():
+        n_idle = len(idle_workers)
+        q_len = len(task_heap)
+        if n_idle > 0:
+            desired = min(worker_count * 2, n_idle + max(1, worker_count // 4))
+        elif q_len < buffer_target:
+            desired = buffer_target - q_len
+        else:
+            desired = 0
+        with shared_split_lock:
+            shared_split_tokens.value = desired
+
+    def dispatch_to_idle():
+        nonlocal total_tasks_dispatched
+        while idle_workers and task_heap:
+            task = heapq.heappop(task_heap)
+            task_path, task_seq, task_spikes, task_min_max_z = task
+            # Skip any queued subtree whose ancestor spike is already disproved
+            if _bnb_spikes_disproved_by_front(task_spikes, cert_front):
+                continue
+            # Skip any queued subtree already pruned by Rule 1
+            r1_limit, _ = _bnb_cert_front_limits(
+                cert_front, task_path, initial_best_score
+            )
+            if task_min_max_z >= r1_limit:
+                totals['nodes'] += 1
+                totals['pruned_rule1'] += 1
+                continue
+            wid = idle_workers.pop()
+            busy_workers.add(wid)
+            master_conns[wid].send(("TASK", task))
+            total_tasks_dispatched += 1
+        refresh_split_tokens()
+
+    def broadcast_bound():
+        nonlocal bound_version
+        bound_version += 1
+        payload = ("BOUND", list(cert_front), bound_version)
+        for conn in master_conns.values():
+            conn.send(payload)
+        shared_bound_version.value = bound_version
+
+    prev_context = _BNB_MC_CONTEXT
+    if use_fork:
+        _BNB_MC_CONTEXT = context_tuple
+
+    try:
+        for wid in range(worker_count):
+            parent_conn, child_conn = mp_ctx.Pipe(duplex=True)
+            proc = mp_ctx.Process(
+                target=_bnb_mc_worker_main,
+                args=(
+                    wid,
+                    child_conn,
+                    shared_split_tokens,
+                    shared_split_lock,
+                    shared_bound_version,
+                    None if use_fork else context_tuple,
+                ),
+                daemon=False,
+            )
+            proc.start()
+            child_conn.close()
+            workers.append(proc)
+            master_conns[wid] = parent_conn
+            conn_to_wid[parent_conn] = wid
+            idle_workers.append(wid)
+
+        # Keep lower worker IDs popped first so worker 0 takes the leftmost task
+        idle_workers.reverse()
+        if cert_front:
+            broadcast_bound()
+        dispatch_to_idle()
+
+        active_conns = list(master_conns.values())
+
+        while busy_workers or task_heap:
+            ready_conns = mp_wait(active_conns)
+            for conn in ready_conns:
+                while conn.poll():
+                    try:
+                        msg = conn.recv()
+                    except EOFError:
+                        wid = conn_to_wid[conn]
+                        raise RuntimeError(
+                            f"BnB worker {wid} exited unexpectedly before completing search."
+                        )
+
+                    tag = msg[0]
+                    if tag == "DONATE":
+                        _, _, donated_tasks = msg
+                        for d_task in donated_tasks:
+                            d_path, d_seq, d_spikes, d_min_max_z = d_task
+                            if _bnb_spikes_disproved_by_front(d_spikes, cert_front):
+                                continue
+                            r1_limit, _ = _bnb_cert_front_limits(
+                                cert_front, d_path, initial_best_score
+                            )
+                            if d_min_max_z >= r1_limit:
+                                totals['nodes'] += 1
+                                totals['pruned_rule1'] += 1
+                                continue
+                            d_depth = len(d_seq)
+                            if d_depth > max_split_depth:
+                                max_split_depth = d_depth
+                            heapq.heappush(task_heap, d_task)
+                    elif tag == "SOLUTION":
+                        _, _, is_cert, s_path, s_seq, s_score, s_spikes = msg
+                        if is_cert:
+                            cert_front, changed = _bnb_merge_cert_front(
+                                cert_front, s_path, s_score, initial_best_score
+                            )
+                            if changed:
+                                if (
+                                    best_cert_seq is None
+                                    or s_score < best_cert_score
+                                    or (s_score == best_cert_score and s_path < best_cert_path)
+                                ):
+                                    best_cert_path = s_path
+                                    best_cert_seq = s_seq
+                                    best_cert_score = s_score
+                                broadcast_bound()
+                        else:
+                            if not _bnb_spikes_disproved_by_front(s_spikes, cert_front):
+                                anomalous_candidates.append((s_path, s_seq, s_score, s_spikes))
+                    elif tag == "DONE":
+                        _, wid = msg
+                        busy_workers.discard(wid)
+                        idle_workers.append(wid)
+                    elif tag == "ERROR":
+                        _, wid, tb = msg
+                        raise RuntimeError(f"BnB worker {wid} failed:\n{tb}")
+
+            dispatch_to_idle()
+
+        # Gracefully stop workers and collect exact aggregated statistics
+        with shared_split_lock:
+            shared_split_tokens.value = 0
+
+        for wid, conn in master_conns.items():
+            conn.send(("STOP",))
+
+        pending_stats = set(master_conns.keys())
+        while pending_stats:
+            conns_left = [master_conns[w] for w in pending_stats]
+            for conn in mp_wait(conns_left):
+                while conn.poll():
+                    try:
+                        msg = conn.recv()
+                    except EOFError:
+                        pending_stats.discard(conn_to_wid[conn])
+                        break
+                    if msg[0] == "FINAL_STATS":
+                        _, wid, w_counts = msg
+                        for k in totals:
+                            totals[k] += w_counts[k]
+                        pending_stats.discard(wid)
+                    elif msg[0] == "ERROR":
+                        _, wid, tb = msg
+                        raise RuntimeError(f"BnB worker {wid} failed during shutdown:\n{tb}")
+
+        for proc in workers:
+            proc.join(timeout=5.0)
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=1.0)
+    finally:
+        _BNB_MC_CONTEXT = prev_context
+        for conn in master_conns.values():
+            try:
+                conn.close()
+            except Exception:
+                pass
+        for proc in workers:
+            if proc.is_alive():
+                try:
+                    proc.terminate()
+                    proc.join(timeout=1.0)
+                    if proc.is_alive():
+                        proc.kill()
+                        proc.join(timeout=1.0)
+                except Exception:
+                    pass
+
+    # 4. Resolve any surviving non-monotonic Rule-4 anomalous candidates exactly
+    surviving_anomalies = [
+        cand for cand in anomalous_candidates
+        if (
+            (
+                best_cert_seq is None
+                or cand[2] < best_cert_score
+                or (cand[2] == best_cert_score and cand[0] < best_cert_path)
+            )
+            and not _bnb_spikes_disproved_by_front(cand[3], cert_front)
+        )
+    ]
+
+    if surviving_anomalies:
+        best_sequence, best_score = _bnb_mc_verify_anomalous_candidates(
+            pallet_dims,
+            sorted_box_list,
+            use_guarantee,
+            num_extpts_to_try,
+            box_orientations_dict,
+            tallest_remaining_orientations,
+            dimension_tuples,
+            initial_best_score,
+            best_cert_path,
+            best_cert_seq,
+            best_cert_score,
+            surviving_anomalies,
+        )
+    else:
+        best_sequence = best_cert_seq
+        best_score = best_cert_score
+
+    # 5. Reconstruct optimal pallet state
     if best_sequence:
         for dims, x, y in best_sequence:
             pallet.place_box(dims, x, y)
@@ -1657,8 +2355,8 @@ def place_box_list_branch_and_bound_mc(pallet, box_list, criterion=DEFAULT_CRITE
         'best_score': best_score,
         'optimality_guarantee': use_guarantee,
         'topx_limit': num_extpts_to_try,
-        'tasks': len(tasks),
-        'task_depth': max_depth,
+        'tasks': total_tasks_dispatched,
+        'task_depth': max_split_depth,
         'workers': worker_count,
     }
 
@@ -2006,22 +2704,18 @@ def run_algorithm_comparison_test(start_order=1, end_order=None, order_dict=test
     
     return results_df
 
-def run_bnb_mc_speed_comparison(mp_core_max=DEFAULT_MP_CORES, start_order=1, end_order=None, order_dict=test_orders_dict, criterion=DEFAULT_CRITERION, metric=Metric.MAX_Z, print_pallets=False, save_pallets=False, bnb_topx=BNB_TOPX_DEFAULT_LIMIT):
+def run_bnb_mc_speed_comparison(mp_core_max=DEFAULT_MP_CORES, start_order=1, end_order=None, order_dict=test_orders_dict, criterion=DEFAULT_CRITERION, metric=Metric.MAX_Z, print_pallets=False, save_pallets=False, bnb_topx=BNB_TOPX_DEFAULT_LIMIT, optimality_guarantee=False, output_dir="./results/spee_comparisons"):
     """Compare serial and multi-core BnB runtimes and verify identical pallets.
 
-    One serial baseline is run per order, followed by one multi-core run for
-    every requested core count. The CSV contains one row per implementation,
-    order, and core count. Multi-core pallets are compared against the serial
-    pallet using their canonical box placements, heightmap, and maximum height.
+    Runs one serial baseline per order followed by one multi-core run for each
+    power-of-two core count up to `mp_core_max`. Verifies exact equality of
+    canonical box placements, heightmap, and max_z against the serial baseline
+    and atomically saves the combined CSV.
     """
-
     if end_order is None:
         end_order = max(order_dict.keys())
 
-    if order_dict == orders_dict:
-        prefix = "O"
-    else:
-        prefix = "T"
+    prefix = "O" if order_dict == orders_dict else "T"
 
     order_ids = [
         order_id for order_id in sorted(order_dict.keys())
@@ -2033,29 +2727,8 @@ def run_bnb_mc_speed_comparison(mp_core_max=DEFAULT_MP_CORES, start_order=1, end
         )
 
     core_counts = get_core_counts_list(mp_core_max)
+    all_core_counts = [1] + core_counts
     result_rows = []
-
-    def canonical_boxes(pallet_to_compare):
-        return sorted(
-            (
-                box['x'], box['y'], box['z'],
-                box['dx'], box['dy'], box['dz']
-            )
-            for box in pallet_to_compare.boxes
-        )
-
-    def metric_value(pallet_to_measure):
-        if metric == Metric.MAX_Z:
-            return pallet_to_measure.get_max_height()
-        if metric == Metric.PACKING_SCORE:
-            return pallet_to_measure.get_packing_score()
-        if metric == Metric.VOLUME_UTILIZATION:
-            return pallet_to_measure.get_volume_utilization()
-        if metric == Metric.COG_Z:
-            return pallet_to_measure.get_center_of_gravity_z()
-        if metric == Metric.ALL:
-            return None
-        raise ValueError(f"Unsupported metric: {metric}")
 
     for order_id in tqdm(order_ids, desc="Testing orders", unit=" orders"):
         print("\n" + "-" * 124)
@@ -2071,12 +2744,13 @@ def run_bnb_mc_speed_comparison(mp_core_max=DEFAULT_MP_CORES, start_order=1, end
             box_list,
             criterion=criterion,
             leave_tqdm=False,
-            optimality_guarantee=False,
+            optimality_guarantee=optimality_guarantee,
             num_extpts_to_try=bnb_topx,
         )
         serial_seconds = time.perf_counter() - serial_start
-        serial_metric = metric_value(serial_pallet)
-        serial_boxes = canonical_boxes(serial_pallet)
+        serial_metric = _extract_pallet_metric(serial_pallet, metric)
+        serial_boxes = _canonical_boxes(serial_pallet)
+        serial_hm_hash = hashlib.sha256(serial_pallet.heightmap.tobytes()).hexdigest()
 
         serial_pallet.get_pallet_results(
             algo=Algorithm.BNB,
@@ -2087,28 +2761,19 @@ def run_bnb_mc_speed_comparison(mp_core_max=DEFAULT_MP_CORES, start_order=1, end
             bnb_stats=serial_stats,
         )
 
-        result_rows.append({
-            'order_id': order_id,
-            'order_label': f"{prefix}{order_id}",
-            'implementation': 'single_core',
-            'cores': 1,
-            'seconds': serial_seconds,
-            'speedup_vs_single_core': 1.0,
-            'metric': metric.value,
-            'metric_value': serial_metric,
-            'max_z': serial_pallet.get_max_height(),
-            'box_count': len(serial_pallet.boxes),
-            'nodes': serial_stats['nodes'],
-            'pruned_rule1': serial_stats['pruned_rule1'],
-            'pruned_rule4': serial_stats['pruned_rule4'],
-            'pruned_filt1': serial_stats['pruned_filt1'],
-            'pruned_filt2': serial_stats['pruned_filt2'],
-            'pruned_filt5': serial_stats['pruned_filt5'],
-            'matches_single_core': True,
-            'boxes_match': True,
-            'heightmap_match': True,
-            'max_z_match': True,
-        })
+        results_map = {
+            1: {
+                'order_id': order_id,
+                'cores': 1,
+                'seconds': float(serial_seconds),
+                'metric_value': float(serial_metric) if serial_metric is not None else None,
+                'max_z': int(serial_pallet.get_max_height()),
+                'box_count': len(serial_pallet.boxes),
+                'stats': serial_stats,
+                'canonical_boxes': serial_boxes,
+                'heightmap_hash': serial_hm_hash,
+            }
+        }
         print(
             f"Serial finished | {serial_seconds:.6f}s | "
             f"max_z={serial_pallet.get_max_height()} | nodes={serial_stats['nodes']}"
@@ -2124,26 +2789,24 @@ def run_bnb_mc_speed_comparison(mp_core_max=DEFAULT_MP_CORES, start_order=1, end
                 box_list,
                 criterion=criterion,
                 leave_tqdm=False,
-                optimality_guarantee=False,
+                optimality_guarantee=optimality_guarantee,
                 num_extpts_to_try=bnb_topx,
                 cores=cores,
             )
             mc_seconds = time.perf_counter() - mc_start
-            mc_metric = metric_value(mc_pallet)
+            mc_metric = _extract_pallet_metric(mc_pallet, metric)
+            mc_boxes = _canonical_boxes(mc_pallet)
+            mc_hm_hash = hashlib.sha256(mc_pallet.heightmap.tobytes()).hexdigest()
 
-            boxes_match = canonical_boxes(mc_pallet) == serial_boxes
-            heightmap_match = np.array_equal(
-                mc_pallet.heightmap, serial_pallet.heightmap
-            )
-            max_z_match = (
-                mc_pallet.get_max_height() == serial_pallet.get_max_height()
-            )
+            boxes_match = (mc_boxes == serial_boxes)
+            heightmap_match = np.array_equal(mc_pallet.heightmap, serial_pallet.heightmap)
+            max_z_match = (mc_pallet.get_max_height() == serial_pallet.get_max_height())
             pallets_match = boxes_match and heightmap_match and max_z_match
             speedup = serial_seconds / mc_seconds if mc_seconds > 0 else math.inf
 
             if not pallets_match:
                 serial_box_set = set(serial_boxes)
-                mc_box_set = set(canonical_boxes(mc_pallet))
+                mc_box_set = set(mc_boxes)
                 only_serial = sorted(serial_box_set - mc_box_set)
                 only_mc = sorted(mc_box_set - serial_box_set)
                 differing_cells = int(np.count_nonzero(
@@ -2153,31 +2816,24 @@ def run_bnb_mc_speed_comparison(mp_core_max=DEFAULT_MP_CORES, start_order=1, end
                     mc_pallet.heightmap.astype(np.int64)
                     - serial_pallet.heightmap.astype(np.int64)
                 )))
-
                 print("\n*** PALLET MISMATCH DETECTED ***")
-                print(f"Order: {prefix}{order_id}")
-                print(f"Multi-core process count: {cores}")
-                print(f"Boxes match: {boxes_match}")
-                print(f"Heightmaps match: {heightmap_match}")
-                print(f"Maximum heights match: {max_z_match}")
+                print(f"Order: {prefix}{order_id} | Cores: {cores}")
+                print(
+                    f"Matches -> boxes: {boxes_match}, heightmap: {heightmap_match}, "
+                    f"max_z: {max_z_match}"
+                )
                 print(
                     f"Serial max_z={serial_pallet.get_max_height()}, "
-                    f"multi-core max_z={mc_pallet.get_max_height()}"
+                    f"MC max_z={mc_pallet.get_max_height()}"
                 )
                 print(
-                    f"Serial metric={serial_metric}, "
-                    f"multi-core metric={mc_metric}"
+                    f"Differing heightmap cells: {differing_cells}, "
+                    f"max delta: {max_heightmap_delta}"
                 )
-                print(
-                    f"Serial boxes={len(serial_pallet.boxes)}, "
-                    f"multi-core boxes={len(mc_pallet.boxes)}"
-                )
-                print(f"Differing heightmap cells: {differing_cells}")
-                print(f"Maximum absolute heightmap delta: {max_heightmap_delta}")
-                print(f"Placements only in serial, first 10: {only_serial[:10]}")
-                print(f"Placements only in multi-core, first 10: {only_mc[:10]}")
+                print(f"Only in serial (first 10): {only_serial[:10]}")
+                print(f"Only in MC (first 10):     {only_mc[:10]}")
                 print(f"Serial stats: {serial_stats}")
-                print(f"Multi-core stats: {mc_stats}")
+                print(f"MC stats:     {mc_stats}")
 
             mc_pallet.get_pallet_results(
                 algo=Algorithm.BNB,
@@ -2188,42 +2844,34 @@ def run_bnb_mc_speed_comparison(mp_core_max=DEFAULT_MP_CORES, start_order=1, end
                 bnb_stats=mc_stats,
             )
 
-            result_rows.append({
+            results_map[cores] = {
                 'order_id': order_id,
-                'order_label': f"{prefix}{order_id}",
-                'implementation': 'multi_core',
                 'cores': cores,
-                'seconds': mc_seconds,
-                'speedup_vs_single_core': speedup,
-                'metric': metric.value,
-                'metric_value': mc_metric,
-                'max_z': mc_pallet.get_max_height(),
+                'seconds': float(mc_seconds),
+                'metric_value': float(mc_metric) if mc_metric is not None else None,
+                'max_z': int(mc_pallet.get_max_height()),
                 'box_count': len(mc_pallet.boxes),
-                'nodes': mc_stats['nodes'],
-                'pruned_rule1': mc_stats['pruned_rule1'],
-                'pruned_rule4': mc_stats['pruned_rule4'],
-                'pruned_filt1': mc_stats['pruned_filt1'],
-                'pruned_filt2': mc_stats['pruned_filt2'],
-                'pruned_filt5': mc_stats['pruned_filt5'],
-                'matches_single_core': pallets_match,
-                'boxes_match': boxes_match,
-                'heightmap_match': heightmap_match,
-                'max_z_match': max_z_match,
-            })
+                'stats': mc_stats,
+                'canonical_boxes': mc_boxes,
+                'heightmap_hash': mc_hm_hash,
+            }
             print(
                 f"MP{cores} finished | {mc_seconds:.6f}s | "
                 f"speedup={speedup:.3f}x | match={pallets_match}"
             )
 
-    output_dir = "./results/speed_comparisons"
+        order_rows, _, _ = _build_speed_comparison_rows(
+            order_id, prefix, metric, all_core_counts, results_map
+        )
+        result_rows.extend(order_rows)
+
     os.makedirs(output_dir, exist_ok=True)
-    output_csv = (
-        f"{output_dir}/speed_comparison_"
-        f"{prefix}{start_order}_to_{prefix}{end_order}_"
-        f"MP-2-{mp_core_max}.csv"
+    output_csv = os.path.join(
+        output_dir,
+        f"speed_comparison_{prefix}{start_order}_to_{prefix}{end_order}_MP-2-{mp_core_max}.csv",
     )
     results_df = pd.DataFrame(result_rows)
-    results_df.to_csv(output_csv, index=False)
+    _write_csv_atomic(results_df, output_csv)
 
     mismatch_count = int((~results_df['matches_single_core']).sum())
     print("\n" + "-" * 124)
@@ -2241,12 +2889,33 @@ def run_smart_concurrent_bnb_mc_speed_comparison(
     bnb_topx=BNB_TOPX_DEFAULT_LIMIT,
     output_dir="./results/spee_comparisons/test_orders",
     total_machine_cores=None,
-    max_active_orders=96,
+    max_active_orders=None,
+    optimality_guarantee=False,
+    status_interval_seconds=30.0,
 ):
-    """Smartly schedules benchmark tasks across orders for 100% CPU utilization."""
+    """Bounded-WIP, finishing-first overnight scheduler targeting ~100% CPU use.
+
+    Designed for shared high-core-count compute servers (e.g. 128 cores):
+      1. Resumable & crash-safe: skips orders that already have a saved CSV
+         (checking both `spee_comparison_*.csv` and `speed_comparison_*.csv`)
+         and writes each finished order atomically via temp file + `os.replace`.
+      2. Bounded work-in-progress (WIP): keeps only a small sliding window of
+         active orders (default ~16-32 on 128 cores instead of 128) and always
+         prioritizes finishing active orders over starting new ones so CSVs
+         flush steadily and interrupting early wastes minimal partial work.
+      3. Two-phase exclusive/packed execution for pristine benchmark timings:
+         - Full-width runs (`cores == total_machine_cores`, e.g. 128c) run in
+           clean exclusive bursts with 100% of cores dedicated to one task
+           (briefly `SIGSTOP`-pausing active 1-core tasks, which time via
+           `time.process_time()` so pauses never distort measurements).
+         - Sub-machine runs (`1, 2, 4, ..., C/2`) are bin-packed together with
+           zero core oversubscription and zero pauses on multi-core tasks.
+      4. Clean signal handling & process-group cleanup: on Ctrl+C / SIGTERM,
+         terminates every worker's entire process group (`os.killpg`) so zero
+         orphaned worker processes ever remain on the shared server.
+    """
     if order_list is None:
         order_list = spee_missing_test_orders
-
     if order_dict is None:
         order_dict = test_orders_dict
 
@@ -2255,25 +2924,48 @@ def run_smart_concurrent_bnb_mc_speed_comparison(
 
     if total_machine_cores is None:
         total_machine_cores = os.cpu_count() or mp_core_max
+    total_machine_cores = max(1, int(total_machine_cores))
 
-    all_test_core_counts = [1] + [c for c in get_core_counts_list(mp_core_max) if c <= total_machine_cores]
+    all_test_core_counts = [1] + [
+        c for c in get_core_counts_list(mp_core_max) if c <= total_machine_cores
+    ]
+    full_width_cores = max(all_test_core_counts)
+    has_full_width = (full_width_cores == total_machine_cores and full_width_cores > 1)
+    supports_sigstop = hasattr(signal, "SIGSTOP") and hasattr(signal, "SIGCONT")
 
-    # 1. Skip already-completed orders
+    # Compute Little's-Law bounded WIP window: enough concurrent orders to keep
+    # 100% of cores fed without hoarding dozens of half-done orders in memory.
+    if max_active_orders is None:
+        soft_active_orders = max(4, min(20, math.ceil(total_machine_cores / 8)))
+        hard_active_orders = max(soft_active_orders, min(32, math.ceil(total_machine_cores / 4)))
+        if total_machine_cores < 4:
+            soft_active_orders = max(1, total_machine_cores)
+            hard_active_orders = soft_active_orders
+    else:
+        hard_active_orders = max(1, int(max_active_orders))
+        soft_active_orders = min(hard_active_orders, max(4, min(20, math.ceil(total_machine_cores / 8))))
+        if hard_active_orders < soft_active_orders:
+            soft_active_orders = hard_active_orders
+
+    # 1. Deduplicate and skip already-completed orders on disk
     pending_orders = []
+    seen_oids = set()
     skipped_count = 0
     for oid in order_list:
-        csv_filename = os.path.join(output_dir, f"spee_comparison_{prefix}{oid}.csv")
-        if os.path.exists(csv_filename):
+        if oid in seen_oids:
+            continue
+        seen_oids.add(oid)
+        if _find_existing_speed_csv(output_dir, prefix, oid) is not None:
             skipped_count += 1
         else:
             pending_orders.append(oid)
 
     print("=" * 100)
-    print(f"SMART BnB MULTI-CORE BENCHMARK ORCHESTRATOR (PREEMPTIVE 100% CORE EDITION)")
+    print("SMART BnB MULTI-CORE BENCHMARK SCHEDULER (BOUNDED-WIP / FINISHING-FIRST)")
     print(f"Machine Core Capacity : {total_machine_cores} cores")
-    print(f"Max Active Orders     : {max_active_orders}")
+    print(f"Active Order Window   : soft={soft_active_orders}, hard={hard_active_orders}")
     print(f"Core Counts per Order : {all_test_core_counts}")
-    print(f"Total Orders Given    : {len(order_list)}")
+    print(f"Total Orders Given    : {len(seen_oids)}")
     print(f"Already Completed     : {skipped_count} (skipped)")
     print(f"Remaining to Process  : {len(pending_orders)}")
     print(f"Results Directory     : {output_dir}")
@@ -2283,15 +2975,28 @@ def run_smart_concurrent_bnb_mc_speed_comparison(
         print("All target orders already have results in the output directory. Done!")
         return
 
-    active_orders = []           # list of order_ids in admission order
-    uncompleted_tasks = {}       # order_id -> set(cores_still_needed)
-    running_tasks = {}           # order_id -> set(cores_currently_running)
+    active_orders = []           # order_ids in admission order
+    uncompleted_tasks = {}       # order_id -> set(core counts not yet completed)
+    running_tasks = {}           # order_id -> set(core counts currently running)
     order_results = {}           # order_id -> {cores: result_dict}
-    active_processes = {}        # proc -> (conn, order_id, cores, start_time)
-    paused_serial_procs = set()  # set of 1-core procs currently paused via SIGSTOP
+    task_retries = {}            # (order_id, cores) -> crash retry count
+    failed_orders = []           # order_ids retired due to unrecoverable errors
+    completed_session = 0
+    mismatch_orders = []
 
-    ctx = mp.get_context("fork" if "fork" in mp.get_all_start_methods() else None)
-    supports_sigstop = hasattr(signal, "SIGSTOP") and hasattr(signal, "SIGCONT")
+    # Active child processes: proc -> (conn, order_id, cores, start_time)
+    active_processes = {}
+    conn_to_proc = {}
+    paused_serial_procs = []     # LIFO list of paused 1-core procs (newest paused first)
+    paused_serial_set = set()
+
+    # Scheduler mode:
+    #   "FULL_WIDTH": draining MC to 0 (or running exclusive full-width bursts)
+    #   "PACKING":    co-scheduling 1c + 2..C/2 tasks with zero oversubscription
+    drain_for_full_width = has_full_width
+    max_crash_retries = 1
+
+    mp_ctx = mp.get_context("fork") if "fork" in mp.get_all_start_methods() else mp.get_context()
 
     def admit_order(oid):
         active_orders.append(oid)
@@ -2299,10 +3004,61 @@ def run_smart_concurrent_bnb_mc_speed_comparison(
         running_tasks[oid] = set()
         order_results[oid] = {}
 
+    def retire_order(oid):
+        if oid in active_orders:
+            active_orders.remove(oid)
+        uncompleted_tasks.pop(oid, None)
+        running_tasks.pop(oid, None)
+        order_results.pop(oid, None)
+
+    def kill_proc_group(proc, conn=None):
+        """Cleanly terminate `proc` and its entire process group (zero orphans)."""
+        pid = proc.pid
+        if pid is not None:
+            if supports_sigstop and proc in paused_serial_set:
+                try:
+                    os.kill(pid, signal.SIGCONT)
+                except OSError:
+                    pass
+            if hasattr(os, "killpg"):
+                try:
+                    os.killpg(pid, signal.SIGTERM)
+                except OSError:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+            else:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+            proc.join(timeout=1.5)
+            if proc.is_alive():
+                if hasattr(os, "killpg"):
+                    try:
+                        os.killpg(pid, signal.SIGKILL)
+                    except OSError:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                else:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                proc.join(timeout=1.0)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
     def launch_task(order_id, cores_to_run):
         box_list = get_box_list_from_order(order_id, order_dict)
-        parent_conn, child_conn = ctx.Pipe(duplex=False)
-        proc = ctx.Process(
+        parent_conn, child_conn = mp_ctx.Pipe(duplex=False)
+        proc = mp_ctx.Process(
             target=_bnb_speed_test_worker,
             args=(
                 child_conn,
@@ -2312,53 +3068,191 @@ def run_smart_concurrent_bnb_mc_speed_comparison(
                 criterion,
                 metric,
                 bnb_topx,
+                optimality_guarantee,
             ),
             daemon=False,
         )
         proc.start()
         child_conn.close()
-        active_processes[proc] = (parent_conn, order_id, cores_to_run, time.time())
+        active_processes[proc] = (parent_conn, order_id, cores_to_run, time.monotonic())
+        conn_to_proc[parent_conn] = proc
         running_tasks[order_id].add(cores_to_run)
+        return proc
+
+    def get_core_usage():
+        mc_used = 0
+        running_1c = []
+        for p, (_, _, c, _) in active_processes.items():
+            if c > 1:
+                mc_used += c
+            elif p not in paused_serial_set:
+                running_1c.append(p)
+        return mc_used, running_1c
+
+    def pause_serial_procs(count_needed, running_1c):
+        """SIGSTOP up to `count_needed` newest 1-core tasks so oldest finish first."""
+        if not supports_sigstop or count_needed <= 0:
+            return 0
+        # Sort newest-admitted / most-recently-started first so oldest orders keep running
+        ordered = sorted(
+            running_1c,
+            key=lambda p: (
+                active_orders.index(active_processes[p][1])
+                if active_processes[p][1] in active_orders else -1,
+                active_processes[p][3],
+            ),
+            reverse=True,
+        )
+        paused_now = 0
+        for p in ordered:
+            if paused_now >= count_needed:
+                break
+            try:
+                os.kill(p.pid, signal.SIGSTOP)
+                paused_serial_set.add(p)
+                paused_serial_procs.append(p)
+                paused_now += 1
+            except OSError:
+                pass
+        return paused_now
+
+    def resume_serial_procs(max_to_resume):
+        """SIGCONT up to `max_to_resume` oldest paused 1-core tasks."""
+        if not supports_sigstop or max_to_resume <= 0 or not paused_serial_procs:
+            return 0
+        # Resume oldest-admitted orders first so they complete and flush to CSV ASAP
+        paused_serial_procs.sort(
+            key=lambda p: (
+                active_orders.index(active_processes[p][1])
+                if p in active_processes and active_processes[p][1] in active_orders
+                else 10**9
+            )
+        )
+        resumed = 0
+        still_paused = []
+        for p in paused_serial_procs:
+            if p not in active_processes:
+                paused_serial_set.discard(p)
+                continue
+            if resumed < max_to_resume:
+                try:
+                    os.kill(p.pid, signal.SIGCONT)
+                    paused_serial_set.discard(p)
+                    resumed += 1
+                    continue
+                except OSError:
+                    paused_serial_set.discard(p)
+                    continue
+            still_paused.append(p)
+        paused_serial_procs[:] = still_paused
+        return resumed
+
+    def order_priority_key(oid):
+        """Sort key preferring orders closest to completion, then oldest admission."""
+        remaining_count = len(uncompleted_tasks[oid])
+        serial_done = 0 if (1 not in uncompleted_tasks[oid]) else 1
+        admit_idx = active_orders.index(oid)
+        return (serial_done, remaining_count, admit_idx)
+
+    def handle_sigterm(signum, frame):
+        raise KeyboardInterrupt(f"Received signal {signum}")
+
+    prev_sigterm = None
+    if hasattr(signal, "SIGTERM"):
+        try:
+            prev_sigterm = signal.signal(signal.SIGTERM, handle_sigterm)
+        except (ValueError, OSError):
+            prev_sigterm = None
+
+    last_status_time = time.monotonic()
+    interrupted = False
 
     try:
         while active_processes or pending_orders or active_orders:
-            # A. Reap finished or dead processes
+            # --- A. Reap finished or unexpectedly exited worker processes ---
             finished_procs = []
-            for proc, (conn, oid, cores_run, start_t) in list(active_processes.items()):
+            for proc, (conn, oid, cores_run, _) in list(active_processes.items()):
                 if conn.poll():
                     try:
                         res = conn.recv()
                     except EOFError:
-                        res = {'error': 'EOFError reading from worker pipe', 'traceback': 'Worker terminated unexpectedly.'}
+                        res = {
+                            'error': 'EOFError reading worker pipe',
+                            'traceback': 'Worker process terminated before sending result.',
+                        }
+                    conn_to_proc.pop(conn, None)
                     conn.close()
-                    paused_serial_procs.discard(proc)
+                    if proc in paused_serial_set:
+                        paused_serial_set.discard(proc)
+                        try:
+                            paused_serial_procs.remove(proc)
+                        except ValueError:
+                            pass
                     proc.join(timeout=1.0)
                     if proc.is_alive():
-                        proc.terminate()
+                        kill_proc_group(proc)
                     finished_procs.append(proc)
 
-                    running_tasks[oid].discard(cores_run)
+                    if oid in running_tasks:
+                        running_tasks[oid].discard(cores_run)
                     if res.get('error'):
-                        print(f"\n[ERROR] Task ({prefix}{oid}, {cores_run} cores) failed:\n{res.get('traceback')}", flush=True)
-                    else:
+                        print(
+                            f"\n[ERROR] Task ({prefix}{oid}, {cores_run}c) failed:\n"
+                            f"{res.get('traceback', res.get('error'))}",
+                            flush=True,
+                        )
+                        # Retire failed order cleanly (never infinite-loop on broken order)
+                        if oid in active_orders:
+                            for p_other, (c_other, o_other, _, _) in list(active_processes.items()):
+                                if o_other == oid and p_other is not proc:
+                                    conn_to_proc.pop(c_other, None)
+                                    kill_proc_group(p_other, c_other)
+                                    finished_procs.append(p_other)
+                                    paused_serial_set.discard(p_other)
+                            retire_order(oid)
+                            failed_orders.append(oid)
+                    elif oid in uncompleted_tasks:
                         uncompleted_tasks[oid].discard(cores_run)
                         order_results[oid][cores_run] = res
 
                 elif not proc.is_alive():
+                    conn_to_proc.pop(conn, None)
                     conn.close()
-                    paused_serial_procs.discard(proc)
+                    if proc in paused_serial_set:
+                        paused_serial_set.discard(proc)
+                        try:
+                            paused_serial_procs.remove(proc)
+                        except ValueError:
+                            pass
                     proc.join()
                     finished_procs.append(proc)
-                    running_tasks[oid].discard(cores_run)
-                    print(f"\n[WARN] Worker for {prefix}{oid} ({cores_run} cores) exited prematurely. Re-queuing.", flush=True)
+                    if oid in running_tasks:
+                        running_tasks[oid].discard(cores_run)
+                    retries = task_retries.get((oid, cores_run), 0) + 1
+                    task_retries[(oid, cores_run)] = retries
+                    if retries <= max_crash_retries:
+                        print(
+                            f"\n[WARN] Worker for {prefix}{oid} ({cores_run}c) exited "
+                            f"unexpectedly (retry {retries}/{max_crash_retries}).",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"\n[ERROR] Worker for {prefix}{oid} ({cores_run}c) crashed "
+                            f"repeatedly; retiring order {prefix}{oid}.",
+                            flush=True,
+                        )
+                        if oid in active_orders:
+                            retire_order(oid)
+                            failed_orders.append(oid)
 
             for proc in finished_procs:
-                del active_processes[proc]
+                active_processes.pop(proc, None)
 
-            # B. Save and retire any orders that have completed all core counts
+            # --- B. Save and retire any orders with all core counts completed ---
             for oid in list(active_orders):
                 if len(order_results[oid]) == len(all_test_core_counts):
-                    _save_order_speed_comparison_csv(
+                    all_ok, _ = _save_order_speed_comparison_csv(
                         order_id=oid,
                         prefix=prefix,
                         metric=metric,
@@ -2366,128 +3260,255 @@ def run_smart_concurrent_bnb_mc_speed_comparison(
                         results_map=order_results[oid],
                         output_dir=output_dir,
                     )
-                    active_orders.remove(oid)
-                    del uncompleted_tasks[oid]
-                    del running_tasks[oid]
-                    del order_results[oid]
+                    completed_session += 1
+                    if not all_ok:
+                        mismatch_orders.append(oid)
+                    retire_order(oid)
 
-            # C. Calculate core usage separating Multi-Core vs Active 1-Core tasks
-            mc_used_cores = sum(
-                c for p, (_, _, c, _) in active_processes.items() if c > 1
-            )
-            running_serial_procs = [
-                p for p, (_, _, c, _) in active_processes.items()
-                if c == 1 and p not in paused_serial_procs
-            ]
-            mc_free_cores = total_machine_cores - mc_used_cores
+            if not active_processes and not pending_orders and not active_orders:
+                break
 
-            work_dispatched = False
+            # --- C. Schedule work without exceeding `total_machine_cores` ---
+            mc_used, running_1c = get_core_usage()
 
-            # D. Admit new orders up to max_active_orders if we have capacity
-            while len(active_orders) < max_active_orders and pending_orders:
-                orders_with_pending_mc = sum(
-                    1 for o in active_orders
-                    if any(c > 1 for c in uncompleted_tasks[o])
+            # Check whether we should enter full-width drain mode (only when
+            # testing `cores == total_machine_cores`, e.g. 128c on 128-core host).
+            if has_full_width and not drain_for_full_width:
+                any_order_only_needs_fw = any(
+                    uncompleted_tasks[o] == {full_width_cores}
+                    and full_width_cores not in running_tasks[o]
+                    for o in active_orders
                 )
-                if orders_with_pending_mc >= 4:
-                    break
-                admit_order(pending_orders.pop(0))
+                any_order_needs_fw = any(
+                    full_width_cores in uncompleted_tasks[o]
+                    and full_width_cores not in running_tasks[o]
+                    for o in active_orders
+                )
+                any_sub_mc_launchable = any(
+                    any(
+                        1 < c < full_width_cores and c not in running_tasks[o]
+                        for c in uncompleted_tasks[o]
+                    )
+                    for o in active_orders
+                )
+                # Trigger a clean batched 128c window when:
+                #  - an active order has ONLY 128c left (immediate CSV win), OR
+                #  - no sub-full-width MC tasks remain and either an order needs
+                #    128c or we have room to admit new orders to keep cores busy.
+                free_for_work = total_machine_cores - (mc_used + len(running_1c))
+                if any_order_only_needs_fw:
+                    drain_for_full_width = True
+                elif not any_sub_mc_launchable and any_order_needs_fw:
+                    drain_for_full_width = True
+                elif (
+                    not any_sub_mc_launchable
+                    and pending_orders
+                    and (
+                        len(active_orders) < soft_active_orders
+                        or (
+                            len(active_orders) < hard_active_orders
+                            and free_for_work >= max(2, total_machine_cores // 2)
+                        )
+                    )
+                ):
+                    drain_for_full_width = True
 
-            # E. Priority 1: Schedule Multi-Core tasks (128, 64, 32, 16, 8, 4, 2)
-            while mc_free_cores >= 2:
-                best_mc_candidate = None
-                for oid in active_orders:
-                    avail_mc = [
-                        c for c in uncompleted_tasks[oid]
-                        if c > 1 and c not in running_tasks[oid] and c <= mc_free_cores
+            # PHASE 1: Exclusive full-width burst (e.g. 128c on 128 cores)
+            if has_full_width and drain_for_full_width:
+                if mc_used == 0:
+                    # While already at mc_used == 0, refill active window up to
+                    # soft_active_orders (or a small wave up to hard_active_orders
+                    # if all active orders are only waiting on slow 1c tasks).
+                    active_with_sub_mc = sum(
+                        1 for o in active_orders
+                        if any(1 < c < full_width_cores for c in uncompleted_tasks[o])
+                    )
+                    if len(active_orders) < soft_active_orders:
+                        while len(active_orders) < soft_active_orders and pending_orders:
+                            admit_order(pending_orders.pop(0))
+                    elif active_with_sub_mc == 0 and len(active_orders) < hard_active_orders and pending_orders:
+                        wave_size = min(4, hard_active_orders - len(active_orders), len(pending_orders))
+                        for _ in range(wave_size):
+                            admit_order(pending_orders.pop(0))
+
+                    # Find highest-priority active order needing full_width_cores
+                    fw_candidates = [
+                        o for o in active_orders
+                        if full_width_cores in uncompleted_tasks[o]
+                        and full_width_cores not in running_tasks[o]
                     ]
-                    if avail_mc:
-                        best_mc_candidate = (oid, max(avail_mc))
-                        break
-
-                if best_mc_candidate is None:
-                    break
-
-                oid, chosen_c = best_mc_candidate
-
-                currently_active_total = mc_used_cores + len(running_serial_procs)
-                cores_needed_to_free = (currently_active_total + chosen_c) - total_machine_cores
-
-                if cores_needed_to_free > 0 and supports_sigstop:
-                    for p in reversed(running_serial_procs):
-                        if cores_needed_to_free <= 0:
-                            break
-                        try:
-                            os.kill(p.pid, signal.SIGSTOP)
-                            paused_serial_procs.add(p)
-                            running_serial_procs.remove(p)
-                            cores_needed_to_free -= 1
-                        except OSError:
-                            pass
-
-                launch_task(oid, chosen_c)
-                mc_used_cores += chosen_c
-                mc_free_cores = total_machine_cores - mc_used_cores
-                work_dispatched = True
-
-            # F. Priority 2: Resume paused 1-core tasks or launch new 1-core tasks
-            total_active_cores = mc_used_cores + len(running_serial_procs)
-            totally_free_cores = total_machine_cores - total_active_cores
-
-            if totally_free_cores > 0 and paused_serial_procs:
-                for p in list(paused_serial_procs):
-                    if totally_free_cores <= 0:
-                        break
-                    try:
-                        os.kill(p.pid, signal.SIGCONT)
-                        paused_serial_procs.remove(p)
-                        running_serial_procs.append(p)
-                        totally_free_cores -= 1
-                        work_dispatched = True
-                    except OSError:
-                        paused_serial_procs.discard(p)
-
-            while totally_free_cores > 0:
-                serial_candidate = None
-                for oid in active_orders:
-                    if 1 in uncompleted_tasks[oid] and 1 not in running_tasks[oid]:
-                        serial_candidate = oid
-                        break
-
-                if serial_candidate is not None:
-                    launch_task(serial_candidate, 1)
-                    running_serial_procs.append(None)
-                    totally_free_cores -= 1
-                    work_dispatched = True
-                elif len(active_orders) < max_active_orders and pending_orders:
-                    new_oid = pending_orders.pop(0)
-                    admit_order(new_oid)
-                    work_dispatched = True
-                    break
+                    if fw_candidates:
+                        fw_candidates.sort(key=order_priority_key)
+                        target_oid = fw_candidates[0]
+                        if running_1c and supports_sigstop:
+                            pause_serial_procs(len(running_1c), running_1c)
+                            mc_used, running_1c = get_core_usage()
+                        if not running_1c:
+                            launch_task(target_oid, full_width_cores)
+                            mc_used += full_width_cores
+                    else:
+                        # All active orders have completed their full-width task!
+                        drain_for_full_width = False
                 else:
-                    break
+                    # Still draining sub-MC tasks before full-width burst:
+                    # keep freed cores busy with paused/ready 1c tasks!
+                    free_cores = total_machine_cores - (mc_used + len(running_1c))
+                    if free_cores > 0:
+                        resumed = resume_serial_procs(free_cores)
+                        free_cores -= resumed
+                    if free_cores > 0:
+                        for oid in sorted(active_orders, key=order_priority_key):
+                            if free_cores <= 0:
+                                break
+                            if 1 in uncompleted_tasks[oid] and 1 not in running_tasks[oid]:
+                                launch_task(oid, 1)
+                                free_cores -= 1
 
-            if not work_dispatched:
-                time.sleep(0.02)
+            # PHASE 2: Normal packing mode (co-schedule 1c + 2..C/2 with 0 oversubscription)
+            if not drain_for_full_width:
+                # Admit orders up to soft_active_orders if not using full-width bursts
+                if not has_full_width:
+                    while len(active_orders) < soft_active_orders and pending_orders:
+                        admit_order(pending_orders.pop(0))
 
+                mc_used, running_1c = get_core_usage()
+
+                # 2a. Prioritize starting/resuming 1c tasks for active orders
+                #     (up to half the machine so large C/2 MC tasks always fit)
+                max_1c_budget = max(1, total_machine_cores - (total_machine_cores // 2))
+                if not has_full_width:
+                    max_1c_budget = total_machine_cores
+                free_cores = total_machine_cores - (mc_used + len(running_1c))
+                if free_cores > 0 and len(running_1c) < max_1c_budget:
+                    can_add_1c = min(free_cores, max_1c_budget - len(running_1c))
+                    resumed = resume_serial_procs(can_add_1c)
+                    can_add_1c -= resumed
+                    if can_add_1c > 0:
+                        for oid in sorted(active_orders, key=order_priority_key):
+                            if can_add_1c <= 0:
+                                break
+                            if 1 in uncompleted_tasks[oid] and 1 not in running_tasks[oid]:
+                                launch_task(oid, 1)
+                                can_add_1c -= 1
+
+                # 2b. Bin-pack sub-full-width MC tasks (largest fitting task for
+                #     highest-priority active order)
+                mc_used, running_1c = get_core_usage()
+                while True:
+                    mc_free = total_machine_cores - mc_used
+                    if mc_free < 2:
+                        break
+                    # Choose highest-priority active order with a fitting MC task
+                    chosen = None
+                    for oid in sorted(active_orders, key=order_priority_key):
+                        avail_mc = [
+                            c for c in uncompleted_tasks[oid]
+                            if c > 1
+                            and (not has_full_width or c < full_width_cores)
+                            and c not in running_tasks[oid]
+                            and c <= mc_free
+                        ]
+                        if avail_mc:
+                            chosen = (oid, max(avail_mc))
+                            break
+                    if chosen is None:
+                        break
+
+                    oid, chosen_c = chosen
+                    currently_active = mc_used + len(running_1c)
+                    need_to_free = (currently_active + chosen_c) - total_machine_cores
+                    if need_to_free > 0:
+                        if supports_sigstop and len(running_1c) >= need_to_free:
+                            pause_serial_procs(need_to_free, running_1c)
+                            mc_used, running_1c = get_core_usage()
+                        else:
+                            # Cannot fit without oversubscribing -> stop packing
+                            break
+
+                    launch_task(oid, chosen_c)
+                    mc_used += chosen_c
+
+                # 2c. Fill any still-idle cores with remaining paused/ready 1c tasks
+                mc_used, running_1c = get_core_usage()
+                free_cores = total_machine_cores - (mc_used + len(running_1c))
+                if free_cores > 0:
+                    resumed = resume_serial_procs(free_cores)
+                    free_cores -= resumed
+                if free_cores > 0:
+                    for oid in sorted(active_orders, key=order_priority_key):
+                        if free_cores <= 0:
+                            break
+                        if 1 in uncompleted_tasks[oid] and 1 not in running_tasks[oid]:
+                            launch_task(oid, 1)
+                            free_cores -= 1
+
+                # 2d. If not using full-width bursts and >= 50% of cores are still
+                #     idle because active orders only await slow 1c tasks, admit a
+                #     small replenishment wave up to hard_active_orders.
+                if (
+                    not has_full_width
+                    and free_cores >= max(2, total_machine_cores // 2)
+                    and len(active_orders) < hard_active_orders
+                    and pending_orders
+                ):
+                    admit_order(pending_orders.pop(0))
+                    continue
+
+            # --- D. Periodic live status heartbeat ---
+            now = time.monotonic()
+            if status_interval_seconds and (now - last_status_time) >= status_interval_seconds:
+                mc_used, running_1c = get_core_usage()
+                used_total = mc_used + len(running_1c)
+                mode_label = "FULL_WIDTH" if drain_for_full_width else "PACKING"
+                print(
+                    f"[STATUS {time.strftime('%H:%M:%S')}] "
+                    f"Completed: {completed_session}/{len(seen_oids) - skipped_count} | "
+                    f"Active orders: {len(active_orders)} (pending: {len(pending_orders)}) | "
+                    f"Cores: {used_total}/{total_machine_cores} "
+                    f"(MC:{mc_used} + 1c:{len(running_1c)}, paused:{len(paused_serial_set)}) | "
+                    f"Mode: {mode_label}",
+                    flush=True,
+                )
+                last_status_time = now
+
+            # --- E. Event-driven wait until any worker finishes (0% scheduler CPU) ---
+            if active_processes:
+                wait_conns = [info[0] for info in active_processes.values()]
+                mp_wait(wait_conns, timeout=0.5)
+            elif pending_orders or active_orders:
+                time.sleep(0.05)
+
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\n[INTERRUPT] Graceful shutdown requested — stopping all worker process groups...", flush=True)
     finally:
-        # Clean up all child processes on exit / Ctrl+C / exception so nothing is orphaned
-        for proc, (conn, _, _, _) in list(active_processes.items()):
+        if prev_sigterm is not None:
             try:
-                if supports_sigstop and proc in paused_serial_procs:
-                    os.kill(proc.pid, signal.SIGCONT)
-                if proc.is_alive():
-                    proc.terminate()
-                    proc.join(timeout=1.0)
-                    if proc.is_alive():
-                        proc.kill()
-                conn.close()
-            except Exception:
+                signal.signal(signal.SIGTERM, prev_sigterm)
+            except (ValueError, OSError):
                 pass
+        for proc, (conn, _, _, _) in list(active_processes.items()):
+            kill_proc_group(proc, conn)
+        active_processes.clear()
+        conn_to_proc.clear()
+        paused_serial_procs.clear()
+        paused_serial_set.clear()
 
     print("\n" + "=" * 100)
-    print("All requested BnB speed comparisons finished successfully!")
-    print(f"Results are saved per-order in: {output_dir}")
+    if interrupted:
+        print("Benchmark scheduler stopped cleanly (zero orphan processes, all finished CSVs intact).")
+    else:
+        print("All requested BnB speed comparisons finished successfully!")
+    print(f"Completed this session : {completed_session} orders")
+    print(f"Previously completed   : {skipped_count} orders (skipped)")
+    print(f"Remaining unfinished   : {len(pending_orders) + len(active_orders)} orders")
+    if failed_orders:
+        print(f"Failed orders          : {failed_orders}")
+    if mismatch_orders:
+        print(f"WARNING — Mismatches   : {mismatch_orders}")
+    else:
+        print("Pallet verification    : 100% matched single-core baseline")
+    print(f"Results directory      : {output_dir}")
     print("=" * 100, flush=True)
 
 
@@ -2519,14 +3540,24 @@ topx_missing_test_orders = [2122, 2143, 2189, 2207, 2224, 2249, 2256, 2283, 2288
 algo_missing_given_orders = [37]
 algo_missing_test_orders = [3871, 3922, 3959]
 spee_missing_given_orders = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40]
-spee_missing_test_orders = [2448, 2449, 2450, 2451, 2452, 2453, 2454, 2455, 2456, 2457, 2458, 2459, 2460, 2461, 2462, 2463, 2464, 2465, 2466, 2467, 2468, 2469, 2470, 2471, 2472, 2473, 2474, 2475, 2476, 2477, 2478, 2479, 2480, 2481, 2482, 2483, 2484, 2485, 2486, 2487, 2488, 2489, 2490, 2491, 2492, 2493, 2494, 2495, 2496, 2497, 2498, 2499, 2500, 2501, 2502, 2503, 2504, 2505, 2506, 2507, 2508, 2509, 2510, 2511, 2512, 2513, 2514, 2515, 2516, 2517, 2518, 2519, 2520, 2521, 2522, 2523, 2524, 2525, 2526, 2527, 2528, 2529, 2530, 2531, 2532, 2533, 2534, 2535, 2536, 2537, 2538, 2539, 2540, 2541, 2542, 2543, 2544, 2545, 2546, 2547, 2548, 2549, 2550, 2551, 2552, 2553, 2554, 2555, 2556, 2557, 2558, 2559, 2560, 2561, 2562, 2563, 2564, 2565, 2566, 2567, 2568, 2569, 2570, 2571, 2572, 2573, 2574, 2575, 2576, 2577, 2578, 2579, 2580, 2581, 2582, 2583, 2584, 2585, 2586, 2587, 2588, 2589, 2590, 2591, 2592, 2593, 2594, 2595, 2596, 2597, 2598, 2599, 2600, 2601, 2602, 2603, 2604, 2605, 2606, 2607, 2608, 2609, 2610, 2611, 2612, 2613, 2614, 2615, 2616, 2617, 2618, 2619, 2620, 2621, 2622, 2623, 2624, 2625, 2626, 2627, 2628, 2629, 2630, 2631, 2632, 2633, 2634, 2635, 2636, 2637, 2638, 2639, 2640, 2641, 2642, 2643, 2644, 2645, 2646, 2647, 2648, 2649, 2650, 2651, 2652, 2653, 2654, 2655, 2656, 2657, 2658, 2659, 2660, 2661, 2662, 2663, 2664, 2665, 2666, 2667, 2668, 2669, 2670, 2671, 2672, 2673, 2674, 2675, 2676, 2677, 2678, 2679, 2680, 2681, 2682, 2683, 2684, 2685, 2686, 2687, 2688, 2689, 2690, 2691, 2692, 2693, 2694, 2695, 2696, 2697, 2698, 2699, 2700, 2701, 2702, 2703, 2704, 2705, 2706, 2707, 2708, 2709, 2710, 2711, 2712, 2713, 2714, 2715, 2716, 2717, 2718, 2719, 2720, 2721, 2722, 2723, 2724, 2725, 2726, 2727, 2728, 2729, 2730, 2731, 2732, 2733, 2734, 2735, 2736, 2737, 2738, 2739, 2740, 2741, 2742, 2743, 2744, 2745, 2746, 2747, 2748, 2749, 2750, 2751, 2752, 2753, 2754, 2755, 2756, 2757, 2758, 2759, 2760, 2761, 2762, 2763, 2764, 2765, 2766, 2767, 2768, 2769, 2770, 2771, 2772, 2773, 2774, 2775, 2776, 2777, 2778, 2779, 2780, 2781, 2782, 2783, 2784, 2785, 2786, 2787, 2788, 2789, 2790, 2791, 2792, 2793, 2794, 2795, 2796, 2797, 2798, 2799, 2800, 2801, 2802, 2803, 2804, 2805, 2806, 2807, 2808, 2809, 2810, 2811, 2812, 2813, 2814, 2815, 2816, 2817, 2818, 2819, 2820, 2821, 2822, 2823, 2824, 2825, 2826, 2827, 2828, 2829, 2830, 2831, 2832, 2833, 2834, 2835, 2836, 2837, 2838, 2839, 2840, 2841, 2842, 2843, 2844, 2845, 2846, 2847, 2848, 2849, 2850, 2851, 2852, 2853, 2854, 2855, 2856, 2857, 2858, 2859, 2860, 2861, 2862, 2863, 2864, 2865, 2866, 2867, 2868, 2869, 2870, 2871, 2872, 2873, 2874, 2875, 2876, 2877, 2878, 2879, 2880, 2881, 2882, 2883, 2884, 2885, 2886, 2887, 2888, 2889, 2890, 2891, 2892, 2893, 2894, 2895, 2896, 2897, 2898, 2899, 2900, 2901, 2902, 2903, 2904, 2905, 2906, 2907, 2908, 2909, 2910, 2911, 2912, 2913, 2914, 2915, 2916, 2917, 2918, 2919, 2920, 2921, 2922, 2923, 2924, 2925, 2926, 2927, 2928, 2929, 2930, 2931, 2932, 2933, 2934, 2935, 2936, 2937, 2938, 2939, 2940, 2941, 2942, 2943, 2944, 2945, 2946, 2947, 2948, 2949, 2950, 2951, 2952, 2953, 2954, 2955, 2956, 2957, 2958, 2959, 2960, 2961, 2962, 2963, 2964, 2965, 2966, 2967, 2968, 2969, 2970, 2971, 2972, 2973, 2974, 2975, 2976, 2977, 2978, 2979, 2980, 2981, 2982, 2983, 2984, 2985, 2986, 2987, 2988, 2989, 2990, 2991, 2992, 2993, 2994, 2995, 2996, 2997, 2998, 2999, 3000, 3001, 3002, 3003, 3004, 3005, 3006, 3007, 3008, 3009, 3010, 3011, 3012, 3013, 3014, 3015, 3016, 3017, 3018, 3019, 3020, 3021, 3022, 3023, 3024, 3025, 3026, 3027, 3028, 3029, 3030, 3031, 3032, 3033, 3034, 3035, 3036, 3037, 3038, 3039, 3040, 3041, 3042, 3043, 3044, 3045, 3046, 3047, 3048, 3049, 3050, 3051, 3052, 3053, 3054, 3055, 3056, 3057, 3058, 3059, 3060, 3061, 3062, 3063, 3064, 3065, 3066, 3067, 3068, 3069, 3070, 3071, 3072, 3073, 3074, 3075, 3076, 3077, 3078, 3079, 3080, 3081, 3082, 3083, 3084, 3085, 3086, 3087, 3088, 3089, 3090, 3091, 3092, 3093, 3094, 3095, 3096, 3097, 3098, 3099, 3100, 3101, 3102, 3103, 3104, 3105, 3106, 3107, 3108, 3109, 3110, 3111, 3112, 3113, 3114, 3115, 3116, 3117, 3118, 3119, 3120, 3121, 3122, 3123, 3124, 3125, 3126, 3127, 3128, 3129, 3130, 3131, 3132, 3133, 3134, 3135, 3136, 3137, 3138, 3139, 3140, 3141, 3142, 3143, 3144, 3145, 3146, 3147, 3148, 3149, 3150, 3151, 3152, 3153, 3154, 3155, 3156, 3157, 3158, 3159, 3160, 3161, 3162, 3163, 3164, 3165, 3166, 3167, 3168, 3169, 3170, 3171, 3172, 3173, 3174, 3175, 3176, 3177, 3178, 3179, 3180, 3181, 3182, 3183, 3184, 3185, 3186, 3187, 3188, 3189, 3190, 3191, 3192, 3193, 3194, 3195, 3196, 3197, 3198, 3199, 3200, 3201, 3202, 3203, 3204, 3205, 3206, 3207, 3208, 3209, 3210, 3211, 3212, 3213, 3214, 3215, 3216, 3217, 3218, 3219, 3220, 3221, 3222, 3223, 3224, 3225, 3226, 3227, 3228, 3229, 3230, 3231, 3232, 3233, 3234, 3235, 3236, 3237, 3238, 3239, 3240, 3241, 3242, 3243, 3244, 3245, 3246, 3247, 3248, 3249, 3250, 3251, 3252, 3253, 3254, 3255, 3256, 3257, 3258, 3259, 3260, 3261, 3262, 3263, 3264, 3265, 3266, 3267, 3268, 3269, 3270, 3271, 3272, 3273, 3274, 3275, 3276, 3277, 3278, 3279, 3280, 3281, 3282, 3283, 3284, 3285, 3286, 3287, 3288, 3289, 3290, 3291, 3292, 3293, 3294, 3295, 3296, 3297, 3298, 3299, 3300, 3301, 3302, 3303, 3304, 3305, 3306, 3307, 3308, 3309, 3310, 3311, 3312, 3313, 3314, 3315, 3316, 3317, 3318, 3319, 3320, 3321, 3322, 3323, 3324, 3325, 3326, 3327, 3328, 3329, 3330, 3331, 3332, 3333, 3334, 3335, 3336, 3337, 3338, 3339, 3340, 3341, 3342, 3343, 3344, 3345, 3346, 3347, 3348, 3349, 3350, 3351, 3352, 3353, 3354, 3355, 3356, 3357, 3358, 3359, 3360, 3361, 3362, 3363, 3364, 3365, 3366, 3367, 3368, 3369, 3370, 3371, 3372, 3373, 3374, 3375, 3376, 3377, 3378, 3379, 3380, 3381, 3382, 3383, 3384, 3385, 3386, 3387, 3388, 3389, 3390, 3391, 3392, 3393, 3394, 3395, 3396, 3397, 3398, 3399, 3400, 3401, 3402, 3403, 3404, 3405, 3406, 3407, 3408, 3409, 3410, 3411, 3412, 3413, 3414, 3415, 3416, 3417, 3418, 3419, 3420, 3421, 3422, 3423, 3424, 3425, 3426, 3427, 3428, 3429, 3430, 3431, 3432, 3433, 3434, 3435, 3436, 3437, 3438, 3439, 3440, 3441, 3442, 3443, 3444, 3445, 3446, 3447, 3448, 3449, 3450, 3451, 3452, 3453, 3454, 3455, 3456, 3457, 3458, 3459, 3460, 3461, 3462, 3463, 3464, 3465, 3466, 3467, 3468, 3469, 3470, 3471, 3472, 3473, 3474, 3475, 3476, 3477, 3478, 3479, 3480, 3481, 3482, 3483, 3484, 3485, 3486, 3487, 3488, 3489, 3490, 3491, 3492, 3493, 3494, 3495, 3496, 3497, 3498, 3499, 3500, 3501, 3502, 3503, 3504, 3505, 3506, 3507, 3508, 3509, 3510, 3511, 3512, 3513, 3514, 3515, 3516, 3517, 3518, 3519, 3520, 3521, 3522, 3523, 3524, 3525, 3526, 3527, 3528, 3529, 3530, 3531, 3532, 3533, 3534, 3535, 3536, 3537, 3538, 3539, 3540, 3541, 3542, 3543, 3544, 3545, 3546, 3547, 3548, 3549, 3550, 3551, 3552, 3553, 3554, 3555, 3556, 3557, 3558, 3559, 3560, 3561, 3562, 3563, 3564, 3565, 3566, 3567, 3568, 3569, 3570, 3571, 3572, 3573, 3574, 3575, 3576, 3577, 3578, 3579, 3580, 3581, 3582, 3583, 3584, 3585, 3586, 3587, 3588, 3589, 3590, 3591, 3592, 3593, 3594, 3595, 3596, 3597, 3598, 3599, 3600, 3601, 3602, 3603, 3604, 3605, 3606, 3607, 3608, 3609, 3610, 3611, 3612, 3613, 3614, 3615, 3616, 3617, 3618, 3619, 3620, 3621, 3622, 3623, 3624, 3625, 3626, 3627, 3628, 3629, 3630, 3631, 3632, 3633, 3634, 3635, 3636, 3637, 3638, 3639, 3640, 3641, 3642, 3643, 3644, 3645, 3646, 3647, 3648, 3649, 3650, 3651, 3652, 3653, 3654, 3655, 3656, 3657, 3658, 3659, 3660, 3661, 3662, 3663, 3664, 3665, 3666, 3667, 3668, 3669, 3670, 3671, 3672, 3673, 3674, 3675, 3676, 3677, 3678, 3679, 3680, 3681, 3682, 3683, 3684, 3685, 3686, 3687, 3688, 3689, 3690, 3691, 3692, 3693, 3694, 3695, 3696, 3697, 3698, 3699, 3700, 3701, 3702, 3703, 3704, 3705, 3706, 3707, 3708, 3709, 3710, 3711, 3712, 3713, 3714, 3715, 3716, 3717, 3718, 3719, 3720, 3721, 3722, 3723, 3724, 3725, 3726, 3727, 3728, 3729, 3730, 3731, 3732, 3733, 3734, 3735, 3736, 3737, 3738, 3739, 3740, 3741, 3742, 3743, 3744, 3745, 3746, 3747, 3748, 3749, 3750, 3751, 3752, 3753, 3754, 3755, 3756, 3757, 3758, 3759, 3760, 3761, 3762, 3763, 3764, 3765, 3766, 3767, 3768, 3769, 3770, 3771, 3772, 3773, 3774, 3775, 3776, 3777, 3778, 3779, 3780, 3781, 3782, 3783, 3784, 3785, 3786, 3787, 3788, 3789, 3790, 3791, 3792, 3793, 3794, 3795, 3796, 3797, 3798, 3799, 3800, 3801, 3802, 3803, 3804, 3805, 3806, 3807, 3808, 3809, 3810, 3811, 3812, 3813, 3814, 3815, 3816, 3817, 3818, 3819, 3820, 3821, 3822, 3823, 3824, 3825, 3826, 3827, 3828, 3829, 3830, 3831, 3832, 3833, 3834, 3835, 3836, 3837, 3838, 3839, 3840, 3841, 3842, 3843, 3844, 3845, 3846, 3847, 3848, 3849, 3850, 3851, 3852, 3853, 3854, 3855, 3856, 3857, 3858, 3859, 3860, 3861, 3862, 3863, 3864, 3865, 3866, 3867, 3868, 3869, 3870, 3871, 3872, 3873, 3874, 3875, 3876, 3877, 3878, 3879, 3880, 3881, 3882, 3883, 3884, 3885, 3886, 3887, 3888, 3889, 3890, 3891, 3892, 3893, 3894, 3895, 3896, 3897, 3898, 3899, 3900, 3901, 3902, 3903, 3904, 3905, 3906, 3907, 3908, 3909, 3910, 3911, 3912, 3913, 3914, 3915, 3916, 3917, 3918, 3919, 3920, 3921, 3922, 3923, 3924, 3925, 3926, 3927, 3928, 3929, 3930, 3931, 3932, 3933, 3934, 3935, 3936, 3937, 3938, 3939, 3940, 3941, 3942, 3943, 3944, 3945, 3946, 3947, 3948, 3949, 3950, 3951, 3952, 3953, 3954, 3955, 3956, 3957, 3958, 3959, 3960, 3961, 3962, 3963, 3964, 3965, 3966, 3967, 3968, 3969, 3970, 3971, 3972, 3973, 3974, 3975, 3976, 3977, 3978, 3979, 3980, 3981, 3982, 3983, 3984, 3985, 3986, 3987, 3988, 3989, 3990, 3991, 3992, 3993, 3994, 3995, 3996, 3997, 3998, 3999]
+spee_missing_test_orders = type_2_test_order_list
 
 if __name__ == "__main__":
     if NOTEBOOK_MODE:
         if testing_speed_comparisons:
             run_bnb_mc_speed_comparison(DEFAULT_MP_CORES, 2000, 2099, test_orders_dict, DEFAULT_CRITERION, Metric.MAX_Z, False)
         elif testing_smart_speed_comparisons:
-            run_smart_concurrent_bnb_mc_speed_comparison(spee_missing_test_orders, DEFAULT_MP_CORES, test_orders_dict, DEFAULT_CRITERION, Metric.MAX_Z, BNB_TOPX_DEFAULT_LIMIT, "./results/speed_comparisons/test_orders", DEFAULT_MP_CORES, DEFAULT_MP_CORES)
+            run_smart_concurrent_bnb_mc_speed_comparison(
+                order_list=spee_missing_test_orders,
+                mp_core_max=DEFAULT_MP_CORES,
+                order_dict=test_orders_dict,
+                criterion=DEFAULT_CRITERION,
+                metric=Metric.MAX_Z,
+                bnb_topx=BNB_TOPX_DEFAULT_LIMIT,
+                output_dir="./results/spee_comparisons/test_orders",
+                total_machine_cores=DEFAULT_MP_CORES,
+                max_active_orders=None,
+            )
         elif current_algo == Algorithm.BNB:
             testpallet, bnb_stats = process_order(current_orderID, algo=current_algo, criterion=current_criterion, order_dict=current_order_dict, metric=current_metric, num_extpts_to_try=current_nett)
             testpallet.get_pallet_results(current_algo, current_orderID, current_order_dict, print_mode=True, bnb_stats=bnb_stats)
@@ -2612,7 +3643,17 @@ if __name__ == "__main__":
         run_bnb_mc_speed_comparison(DEFAULT_MP_CORES, 2500, 2599, test_orders_dict)
 
     elif testing_smart_speed_comparisons:
-        run_smart_concurrent_bnb_mc_speed_comparison(spee_missing_test_orders, DEFAULT_MP_CORES, test_orders_dict, DEFAULT_CRITERION, Metric.MAX_Z, BNB_TOPX_DEFAULT_LIMIT, "./results/speed_comparisons/test_orders", DEFAULT_MP_CORES, DEFAULT_MP_CORES)
+        run_smart_concurrent_bnb_mc_speed_comparison(
+            order_list=spee_missing_test_orders,
+            mp_core_max=DEFAULT_MP_CORES,
+            order_dict=test_orders_dict,
+            criterion=DEFAULT_CRITERION,
+            metric=Metric.MAX_Z,
+            bnb_topx=BNB_TOPX_DEFAULT_LIMIT,
+            output_dir="./results/spee_comparisons/test_orders",
+            total_machine_cores=DEFAULT_MP_CORES,
+            max_active_orders=None,
+        )
     
     else:
         print("No workload specified. Exiting...")
