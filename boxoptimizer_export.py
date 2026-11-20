@@ -2534,7 +2534,7 @@ def run_random_fulfillment_test(start_order=1000, end_order=3999, order_dict=tes
 
     plt.show()
 
-def run_optimality_guarantee_test(start_order=1, end_order=None, order_dict=test_orders_dict, criterion=DEFAULT_CRITERION, metric=Metric.MAX_Z, print_pallets=False, save_pallets=False):    # Run BnB with and without the optimality guarantee on a range of orders and export a comparison CSV
+def run_optimality_guarantee_test(start_order=1, end_order=None, order_dict=test_orders_dict, criterion=DEFAULT_CRITERION, metric=Metric.MAX_Z, print_pallets=False, save_pallets=False, output_dir=None, verbose=True):    # Run BnB with and without the optimality guarantee on a range of orders and export a comparison CSV
     # If no final order is specified, let the final order be the last entry in the dict
     if end_order is None:
         end_order = max(order_dict.keys())
@@ -2545,15 +2545,20 @@ def run_optimality_guarantee_test(start_order=1, end_order=None, order_dict=test
     else:
         prefix = "T"
 
+    if output_dir is None:
+        output_dir = "./results/optg_comparisons"
+
     # Get the order IDs to test between the start and end order IDs
     order_ids = [order_id for order_id in sorted(order_dict.keys()) if start_order <= order_id <= end_order]
 
     result_rows = []
+    order_iter = tqdm(order_ids, desc="Testing orders", unit=" orders") if verbose else order_ids
 
-    for order_id in tqdm(order_ids, desc="Testing orders", unit=" orders"):
-        print(f"\n----------------------------------------------------------------------------------------------------------------------------")
-        print(f"----------------------------------------------------------------------------------------------------------------------------")
-        print(f"Running order {order_id} with guarantee off...")
+    for order_id in order_iter:
+        if verbose:
+            print(f"\n----------------------------------------------------------------------------------------------------------------------------")
+            print(f"----------------------------------------------------------------------------------------------------------------------------")
+            print(f"Running order {order_id} with guarantee off...")
 
         # Run order with no optimality guarantee and get stats
         pallet_no_guarantee = Pallet()
@@ -2562,18 +2567,21 @@ def run_optimality_guarantee_test(start_order=1, end_order=None, order_dict=test
             pallet_no_guarantee, box_list, criterion=criterion, leave_tqdm=False, optimality_guarantee=False
         )
         score_no_guarantee = pallet_no_guarantee.get_max_height() if metric == Metric.MAX_Z else None
-        pallet_no_guarantee.get_pallet_results(algo=Algorithm.BNB, orderID=order_id, order_dict=order_dict, print_mode=print_pallets, save_mode=save_pallets, bnb_stats=stats_no_guarantee)
+        if print_pallets or save_pallets:
+            pallet_no_guarantee.get_pallet_results(algo=Algorithm.BNB, orderID=order_id, order_dict=order_dict, print_mode=print_pallets, save_mode=save_pallets, bnb_stats=stats_no_guarantee)
 
-        print(f"\n----------------------------------------------------------------------------------------------------------------------------")
-        print(f"Running order {order_id} with guarantee on...")
+        if verbose:
+            print(f"\n----------------------------------------------------------------------------------------------------------------------------")
+            print(f"Running order {order_id} with guarantee on...")
 
         # Run order with optimality guarantee and get stats
         pallet_with_guarantee = Pallet()
-        stats_with_guarantee= place_box_list_branch_and_bound(
+        stats_with_guarantee = place_box_list_branch_and_bound(
             pallet_with_guarantee, box_list, criterion=criterion, leave_tqdm=False, optimality_guarantee=True
         )
         score_with_guarantee = pallet_with_guarantee.get_max_height() if metric == Metric.MAX_Z else None
-        pallet_with_guarantee.get_pallet_results(algo=Algorithm.BNB, orderID=order_id, order_dict=order_dict, print_mode=print_pallets, save_mode=save_pallets, bnb_stats=stats_with_guarantee)
+        if print_pallets or save_pallets:
+            pallet_with_guarantee.get_pallet_results(algo=Algorithm.BNB, orderID=order_id, order_dict=order_dict, print_mode=print_pallets, save_mode=save_pallets, bnb_stats=stats_with_guarantee)
 
         # Calculate differences, absolute and relative
         def calculate_row_difference(val_no_guarantee, val_with_guarantee):
@@ -2619,29 +2627,34 @@ def run_optimality_guarantee_test(start_order=1, end_order=None, order_dict=test
             'filt2_diff_abs':           f2_diff,
             'filt2_diff_factor':        f2_factor,
             # Filtered by top-x limiting
-            'filt5_no_guarantee':       stats_no_guarantee['pruned_filt2'],
-            'filt5_with_guarantee':     stats_with_guarantee['pruned_filt2'],
+            'filt5_no_guarantee':       stats_no_guarantee['pruned_filt5'],
+            'filt5_with_guarantee':     stats_with_guarantee['pruned_filt5'],
             'filt5_diff_abs':           f5_diff,
             'filt5_diff_factor':        f5_factor,
         })
 
-        print(f"----------------------------------------------------------------------------------------------------------------------------")
-        print(f"Score  : {score_no_guarantee} (no guarantee) vs {score_with_guarantee} (with guarantee)")
-        print(f"Nodes  : {stats_no_guarantee['nodes']:,} vs {stats_with_guarantee['nodes']:,}  (Difference: {nodes_diff:+,}, Factor: {nodes_factor})")
+        if verbose:
+            print(f"----------------------------------------------------------------------------------------------------------------------------")
+            print(f"Score  : {score_no_guarantee} (no guarantee) vs {score_with_guarantee} (with guarantee)")
+            print(f"Nodes  : {stats_no_guarantee['nodes']:,} vs {stats_with_guarantee['nodes']:,}  (Difference: {nodes_diff:+,}, Factor: {nodes_factor})")
 
-    # Export to CSV
-    output_csv=f"./results/optg_comparisons/optg_comparison_{prefix}{start_order}_to_{prefix}{end_order}.csv"
+    # Export to CSV atomically
+    output_csv = os.path.join(output_dir, f"optg_comparison_{prefix}{start_order}_to_{prefix}{end_order}.csv")
     results_df = pd.DataFrame(result_rows)
-    results_df.to_csv(output_csv, index=False)
-    print(f"\n----------------------------------------------------------------------------------------------------------------------------")
-    print(f"----------------------------------------------------------------------------------------------------------------------------")
-    print(f"Results saved to: {output_csv}")
+    _write_csv_atomic(results_df, output_csv)
+    if verbose:
+        print(f"\n----------------------------------------------------------------------------------------------------------------------------")
+        print(f"----------------------------------------------------------------------------------------------------------------------------")
+        print(f"Results saved to: {output_csv}")
     return results_df
 
-def run_topx_limiting_test(start_order=1, end_order=None, order_dict=test_orders_dict, criterion=DEFAULT_CRITERION, print_pallets=False, save_pallets=False, topx_min=1, topx_max=5, topx_step=1, topx_test_without=True):     # Run BnB with a range of top-X candidate limits on a range of orders and export a comparison CSV
+def run_topx_limiting_test(start_order=1, end_order=None, order_dict=test_orders_dict, criterion=DEFAULT_CRITERION, print_pallets=False, save_pallets=False, topx_min=1, topx_max=5, topx_step=1, topx_test_without=True, output_dir=None, verbose=True):     # Run BnB with a range of top-X candidate limits on a range of orders and export a comparison CSV
     # If no final order is specified, run until the end of the dict
     if end_order is None:
         end_order = max(order_dict.keys())
+
+    if output_dir is None:
+        output_dir = "./results/topx_comparisons"
 
     # Get the order IDs to test between the start and end order IDs
     order_ids = [order_id for order_id in sorted(order_dict.keys()) if start_order <= order_id <= end_order]
@@ -2652,34 +2665,37 @@ def run_topx_limiting_test(start_order=1, end_order=None, order_dict=test_orders
         topx_values_to_test.append(None) # None will trigger the standard, unfiltered BnB run
 
     result_rows = []
+    order_iter = tqdm(order_ids, desc="Testing orders", unit=" orders") if verbose else order_ids
 
-    for order_id in tqdm(order_ids, desc="Testing orders", unit=" orders"):
-        print(f"\n----------------------------------------------------------------------------------------------------------------------------")
-        print(f"----------------------------------------------------------------------------------------------------------------------------")
-        print(f"Running order {order_id}...")
+    for order_id in order_iter:
+        if verbose:
+            print(f"\n----------------------------------------------------------------------------------------------------------------------------")
+            print(f"----------------------------------------------------------------------------------------------------------------------------")
+            print(f"Running order {order_id}...")
         
         box_list = get_box_list_from_order(order_id, order_dict)
 
         for topx_val in topx_values_to_test:
-            starttime = int(time.time())
+            starttime = time.perf_counter()
             limit_label = f"Top-{topx_val}" if topx_val is not None else "No Limit"
-            print(f"\n  Running with {limit_label}...")
+            if verbose:
+                print(f"\n  Running with {limit_label}...")
 
             pallet = Pallet()
             
-            # Run BnB
+            # Run BnB (single-core for exact node/time comparability across limits)
             stats = place_box_list_branch_and_bound(pallet, box_list, criterion=criterion, leave_tqdm=False, optimality_guarantee=False, num_extpts_to_try=topx_val)
             score = pallet.get_max_height()
             
             # Get results based on print and save mode
-            pallet.get_pallet_results(algo=Algorithm.BNB, orderID=order_id, order_dict=order_dict, print_mode=print_pallets, save_mode=save_pallets, bnb_stats=stats)
+            if print_pallets or save_pallets:
+                pallet.get_pallet_results(algo=Algorithm.BNB, orderID=order_id, order_dict=order_dict, print_mode=print_pallets, save_mode=save_pallets, bnb_stats=stats)
 
-            # Record metrics
+            # Record metrics (sub-second precision preserved in (seconds) column)
             total_pruned = (stats['pruned_rule1'] + stats['pruned_rule4'] + stats['pruned_filt1'] + stats['pruned_filt2'] + stats['pruned_filt5'])
-            endtime = int(time.time())
-            secs_taken = endtime - starttime
-            mins_taken = math.floor(secs_taken/60)
-            restseconds = secs_taken % 60
+            secs_taken = time.perf_counter() - starttime
+            mins_taken = int(secs_taken // 60)
+            restseconds = round(secs_taken - (mins_taken * 60), 4)
 
             result_rows.append({
                 'order_id'        : order_id,
@@ -2696,21 +2712,23 @@ def run_topx_limiting_test(start_order=1, end_order=None, order_dict=test_orders
                 'total_pruned'    : total_pruned,
             })
 
-            print(f"Finished! Score: {score} | Nodes: {stats['nodes']:,} | Filter 5 Prunes: {stats['pruned_filt5']:,} | Time taken: {secs_taken} seconds")
+            if verbose:
+                print(f"Finished! Score: {score} | Nodes: {stats['nodes']:,} | Filter 5 Prunes: {stats['pruned_filt5']:,} | Time taken: {secs_taken:.3f} seconds")
 
-    # Export to CSV
-    output_csv = f"./results/topx_comparisons/topx_test_O{start_order}-O{end_order}_L{topx_min}-L{topx_max}-S{topx_step}.csv"
+    # Export to CSV atomically (filename uses O{id} for compatibility with data_processing.ipynb)
+    output_csv = os.path.join(output_dir, f"topx_test_O{start_order}-O{end_order}_L{topx_min}-L{topx_max}-S{topx_step}.csv")
     results_df = pd.DataFrame(result_rows)
-    results_df.to_csv(output_csv, index=False)
+    _write_csv_atomic(results_df, output_csv)
     
-    print(f"\n----------------------------------------------------------------------------------------------------------------------------")
-    print(f"----------------------------------------------------------------------------------------------------------------------------")
-    print(f"----------------------------------------------------------------------------------------------------------------------------")
-    print(f"Testing complete! Results saved to: {output_csv}")
+    if verbose:
+        print(f"\n----------------------------------------------------------------------------------------------------------------------------")
+        print(f"----------------------------------------------------------------------------------------------------------------------------")
+        print(f"----------------------------------------------------------------------------------------------------------------------------")
+        print(f"Testing complete! Results saved to: {output_csv}")
     
     return results_df
 
-def run_algorithm_comparison_test(start_order=1, end_order=None, order_dict=test_orders_dict, criterion=DEFAULT_CRITERION, metric=Metric.MAX_Z, print_pallets=False, save_pallets=False, random_attempts=DEFAULT_MAX_ATTEMPTS, bnb_topx=BNB_TOPX_DEFAULT_LIMIT):     
+def run_algorithm_comparison_test(start_order=1, end_order=None, order_dict=test_orders_dict, criterion=DEFAULT_CRITERION, metric=Metric.MAX_Z, print_pallets=False, save_pallets=False, random_attempts=DEFAULT_MAX_ATTEMPTS, bnb_topx=BNB_TOPX_DEFAULT_LIMIT, output_dir=None, use_mp=False, verbose=True):     
     # If no final order is specified, run until the end of the dict
     if end_order is None:
         end_order = max(order_dict.keys())
@@ -2721,30 +2739,36 @@ def run_algorithm_comparison_test(start_order=1, end_order=None, order_dict=test
     else:
         prefix = "T"
 
+    if output_dir is None:
+        output_dir = "./results/algo_comparisons"
+
     # Get the order IDs to test between the start and end order IDs
     order_ids = [order_id for order_id in sorted(order_dict.keys()) if start_order <= order_id <= end_order]
 
     result_rows = []
+    order_iter = tqdm(order_ids, desc="Testing orders across algorithms", unit=" orders") if verbose else order_ids
 
-    for order_id in tqdm(order_ids, desc="Testing orders across algorithms", unit=" orders"):
-        print(f"\n----------------------------------------------------------------------------------------------------------------------------")
-        print(f"----------------------------------------------------------------------------------------------------------------------------")
-        print(f"Running order {order_id}...")
+    for order_id in order_iter:
+        if verbose:
+            print(f"\n----------------------------------------------------------------------------------------------------------------------------")
+            print(f"----------------------------------------------------------------------------------------------------------------------------")
+            print(f"Running order {order_id}...")
         
         # Iterate over every algorithm in the enum
         for algo in Algorithm:
-            print(f"\n  Running {algo.value.upper()}...")
-            starttime = time.time()
+            if verbose:
+                print(f"\n  Running {algo.value.upper()}...")
+            starttime = time.perf_counter()
             
-            # Process the order based on the algorithm type
+            # Process the order based on the algorithm type (use_mp=False keeps single-core comparison fair and pool-safe)
             if algo == Algorithm.BNB:
-                pallet, bnb_stats = process_order(order_id, algo, criterion=criterion, metric=metric, order_dict=order_dict, leave_tqdm=False, optimality_guarantee=False, num_extpts_to_try=bnb_topx)
+                pallet, bnb_stats = process_order(order_id, algo, criterion=criterion, metric=metric, order_dict=order_dict, leave_tqdm=False, optimality_guarantee=False, num_extpts_to_try=bnb_topx, use_mp=use_mp)
                 nodes = bnb_stats['nodes']
             else:
                 pallet, nodes = process_order(order_id, algo, max_attempts=random_attempts, criterion=criterion, metric=metric, order_dict=order_dict, leave_tqdm=False)
                 bnb_stats = None
                 
-            endtime = time.time()
+            endtime = time.perf_counter()
             secs_taken = round(endtime - starttime, 4)
             
             # Extract metrics
@@ -2756,7 +2780,8 @@ def run_algorithm_comparison_test(start_order=1, end_order=None, order_dict=test
             max_z = pallet.get_max_height()
             
             # Print and/or save the pallet visualizations
-            pallet.get_pallet_results(algo=algo, orderID=order_id, order_dict=order_dict, print_mode=print_pallets, save_mode=save_pallets, bnb_stats=bnb_stats, nodes=nodes)
+            if print_pallets or save_pallets:
+                pallet.get_pallet_results(algo=algo, orderID=order_id, order_dict=order_dict, print_mode=print_pallets, save_mode=save_pallets, bnb_stats=bnb_stats, nodes=nodes)
 
             # Collate run data
             row_data = {
@@ -2794,16 +2819,18 @@ def run_algorithm_comparison_test(start_order=1, end_order=None, order_dict=test
                 })
                 
             result_rows.append(row_data)
-            print(f"    -> Finished {algo.value.upper()} | Score: {max_z} | Fulfillment: {fulfillment}% | Time: {secs_taken}s")
+            if verbose:
+                print(f"    -> Finished {algo.value.upper()} | Score: {max_z} | Fulfillment: {fulfillment}% | Time: {secs_taken}s")
 
-    # Export to csv
-    output_csv = f"./results/algo_comparisons/algorithm_comparison_{prefix}{start_order}_to_{prefix}{end_order}.csv"
+    # Export to csv atomically
+    output_csv = os.path.join(output_dir, f"algorithm_comparison_{prefix}{start_order}_to_{prefix}{end_order}.csv")
     results_df = pd.DataFrame(result_rows)
-    results_df.to_csv(output_csv, index=False)
+    _write_csv_atomic(results_df, output_csv)
     
-    print(f"\n----------------------------------------------------------------------------------------------------------------------------")
-    print(f"----------------------------------------------------------------------------------------------------------------------------")
-    print(f"Testing complete! Results saved to: {output_csv}")
+    if verbose:
+        print(f"\n----------------------------------------------------------------------------------------------------------------------------")
+        print(f"----------------------------------------------------------------------------------------------------------------------------")
+        print(f"Testing complete! Results saved to: {output_csv}")
     
     return results_df
 
@@ -3076,7 +3103,14 @@ def run_smart_concurrent_bnb_mc_speed_comparison(
 
     if not pending_orders:
         print("All target orders already have results in the output directory. Done!")
-        return
+        return {
+            'completed': 0,
+            'skipped': skipped_count,
+            'remaining': 0,
+            'failed': [],
+            'mismatches': [],
+            'interrupted': False,
+        }
 
     active_orders = []           # order_ids in admission order
     uncompleted_tasks = {}       # order_id -> set(core counts not yet completed)
@@ -3613,6 +3647,675 @@ def run_smart_concurrent_bnb_mc_speed_comparison(
         print("Pallet verification    : 100% matched single-core baseline")
     print(f"Results directory      : {output_dir}")
     print("=" * 100, flush=True)
+    return {
+        'completed': completed_session,
+        'skipped': skipped_count,
+        'remaining': len(pending_orders) + len(active_orders),
+        'failed': failed_orders,
+        'mismatches': mismatch_orders,
+        'interrupted': interrupted,
+    }
+
+
+def _find_existing_test_csv(test_name, order_type, order_id, output_dir,
+                            topx_min=1, topx_max=15, topx_step=1):
+    """Return existing non-empty CSV path for a single (test_name, order_type, order_id), or None."""
+    prefix = "O" if order_type == "given" else "T"
+    if test_name == "spee":
+        return _find_existing_speed_csv(output_dir, prefix, order_id)
+    if test_name == "optg":
+        candidate = os.path.join(output_dir, f"optg_comparison_{prefix}{order_id}_to_{prefix}{order_id}.csv")
+    elif test_name == "algo":
+        candidate = os.path.join(output_dir, f"algorithm_comparison_{prefix}{order_id}_to_{prefix}{order_id}.csv")
+    elif test_name == "topx":
+        candidate = os.path.join(output_dir, f"topx_test_O{order_id}-O{order_id}_L{topx_min}-L{topx_max}-S{topx_step}.csv")
+    else:
+        raise ValueError(f"Unknown test_name: {test_name}")
+    if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
+        return candidate
+    return None
+
+
+def _master_single_core_worker(worker_id, worker_conn):
+    """Persistent 1-core worker process for the unified master test pool.
+
+    Runs each dispatched `(test_name, order_type, order_id, config)` job strictly
+    single-core (`use_mp=False`) so node counts, pruning counts, and runtimes
+    remain scientifically identical to single-core baselines, while achieving
+    100% linear throughput across all 128 cores with zero nested process pools.
+    """
+    try:
+        if hasattr(os, "setpgrp"):
+            try:
+                os.setpgrp()
+            except OSError:
+                pass
+        os.environ["TQDM_DISABLE"] = "1"
+        try:
+            plt.switch_backend("Agg")
+        except Exception:
+            pass
+
+        while True:
+            msg = worker_conn.recv()
+            if msg is None:
+                break
+
+            test_name, order_type, order_id, cfg = msg
+            order_dict = orders_dict if order_type == "given" else test_orders_dict
+            output_dir = cfg["output_dir"]
+            os.makedirs(output_dir, exist_ok=True)
+            t0 = time.perf_counter()
+
+            try:
+                if test_name == "algo":
+                    run_algorithm_comparison_test(
+                        start_order=order_id,
+                        end_order=order_id,
+                        order_dict=order_dict,
+                        criterion=cfg["criterion"],
+                        metric=cfg["metric"],
+                        print_pallets=False,
+                        save_pallets=cfg["save_pallets"],
+                        random_attempts=cfg["random_attempts"],
+                        bnb_topx=cfg["bnb_topx"],
+                        output_dir=output_dir,
+                        use_mp=False,
+                        verbose=False,
+                    )
+                elif test_name == "topx":
+                    run_topx_limiting_test(
+                        start_order=order_id,
+                        end_order=order_id,
+                        order_dict=order_dict,
+                        criterion=cfg["criterion"],
+                        print_pallets=False,
+                        save_pallets=cfg["save_pallets"],
+                        topx_min=cfg["topx_min"],
+                        topx_max=cfg["topx_max"],
+                        topx_step=cfg["topx_step"],
+                        topx_test_without=cfg["topx_test_without"],
+                        output_dir=output_dir,
+                        verbose=False,
+                    )
+                elif test_name == "optg":
+                    run_optimality_guarantee_test(
+                        start_order=order_id,
+                        end_order=order_id,
+                        order_dict=order_dict,
+                        criterion=cfg["criterion"],
+                        metric=cfg["metric"],
+                        print_pallets=False,
+                        save_pallets=cfg["save_pallets"],
+                        output_dir=output_dir,
+                        verbose=False,
+                    )
+                else:
+                    raise ValueError(f"Unsupported single-core test type: {test_name}")
+
+                elapsed = time.perf_counter() - t0
+                worker_conn.send(("OK", worker_id, test_name, order_type, order_id, elapsed))
+            except Exception as exc:
+                worker_conn.send((
+                    "ERR",
+                    worker_id,
+                    test_name,
+                    order_type,
+                    order_id,
+                    str(exc),
+                    traceback.format_exc(),
+                ))
+    finally:
+        try:
+            worker_conn.close()
+        except Exception:
+            pass
+
+
+def _run_unified_single_core_pool(phase_label, jobs, total_machine_cores,
+                                  status_interval_seconds=30.0):
+    """Run heterogeneous 1-core `{algo, topx, optg}` jobs across all cores.
+
+    Uses persistent worker processes in isolated process groups, event-driven
+    dispatch (`mp_wait`), live per-test progress reporting, crash resilience,
+    and guaranteed zero-orphan cleanup on `SIGINT`/`SIGTERM`.
+    """
+    if not jobs:
+        return {'completed': 0, 'failed': [], 'by_test': {}, 'interrupted': False}
+
+    worker_count = min(max(1, int(total_machine_cores)), len(jobs))
+    mp_ctx = mp.get_context("fork") if "fork" in mp.get_all_start_methods() else mp.get_context()
+
+    # Track per-test totals for clean status output
+    planned_by_test = {}
+    completed_by_test = {}
+    for test_name, order_type, _, _ in jobs:
+        key = f"{test_name}/{order_type}"
+        planned_by_test[key] = planned_by_test.get(key, 0) + 1
+        completed_by_test.setdefault(key, 0)
+
+    print("\n" + "=" * 100)
+    print(f"MASTER SUITE — {phase_label}")
+    print(f"Workers / Cores : {worker_count} / {total_machine_cores}")
+    print(f"Queued Jobs     : {len(jobs):,}  ({', '.join(f'{k}: {v}' for k, v in sorted(planned_by_test.items()))})")
+    print("=" * 100, flush=True)
+
+    workers = {}          # wid -> (proc, conn)
+    conn_to_wid = {}
+    idle_wids = []
+    inflight = {}         # wid -> (test_name, order_type, order_id, start_monotonic)
+    job_idx = 0
+    completed_total = 0
+    failed_jobs = []
+    interrupted = False
+    phase_start = time.monotonic()
+    last_status = phase_start
+
+    def kill_worker_group(proc, conn):
+        pid = proc.pid
+        if pid is not None:
+            if hasattr(os, "killpg"):
+                try:
+                    os.killpg(pid, signal.SIGTERM)
+                except OSError:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+            else:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+            proc.join(timeout=1.5)
+            if proc.is_alive():
+                if hasattr(os, "killpg"):
+                    try:
+                        os.killpg(pid, signal.SIGKILL)
+                    except OSError:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                else:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                proc.join(timeout=1.0)
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    def spawn_worker(wid):
+        parent_conn, child_conn = mp_ctx.Pipe(duplex=True)
+        proc = mp_ctx.Process(
+            target=_master_single_core_worker,
+            args=(wid, child_conn),
+            daemon=False,
+        )
+        proc.start()
+        child_conn.close()
+        workers[wid] = (proc, parent_conn)
+        conn_to_wid[parent_conn] = wid
+        return proc, parent_conn
+
+    def dispatch_ready():
+        nonlocal job_idx
+        while idle_wids and job_idx < len(jobs):
+            wid = idle_wids.pop()
+            job = jobs[job_idx]
+            job_idx += 1
+            _, conn = workers[wid]
+            conn.send(job)
+            inflight[wid] = (job[0], job[1], job[2], time.monotonic())
+
+    def print_status(force=False):
+        nonlocal last_status
+        now = time.monotonic()
+        if not force and (not status_interval_seconds or (now - last_status) < status_interval_seconds):
+            return
+        elapsed = max(0.001, now - phase_start)
+        rate_per_min = (completed_total / elapsed) * 60.0
+        breakdown = " | ".join(
+            f"{k}:{completed_by_test[k]}/{planned_by_test[k]}"
+            for k in sorted(planned_by_test)
+        )
+        print(
+            f"[STATUS {time.strftime('%H:%M:%S')}] {phase_label} | "
+            f"Done: {completed_total:,}/{len(jobs):,} ({rate_per_min:.1f}/min) | "
+            f"Busy cores: {len(inflight)}/{worker_count} | {breakdown}",
+            flush=True,
+        )
+        last_status = now
+
+    def handle_sigterm(signum, frame):
+        raise KeyboardInterrupt(f"Received signal {signum}")
+
+    prev_sigterm = None
+    if hasattr(signal, "SIGTERM"):
+        try:
+            prev_sigterm = signal.signal(signal.SIGTERM, handle_sigterm)
+        except (ValueError, OSError):
+            prev_sigterm = None
+
+    try:
+        for wid in range(worker_count):
+            spawn_worker(wid)
+            idle_wids.append(wid)
+        idle_wids.reverse()
+        dispatch_ready()
+
+        while inflight or job_idx < len(jobs):
+            active_conns = [workers[w][1] for w in inflight]
+            ready_conns = mp_wait(active_conns, timeout=0.5)
+
+            for conn in ready_conns:
+                wid = conn_to_wid.get(conn)
+                if wid is None:
+                    continue
+                while conn.poll():
+                    try:
+                        msg = conn.recv()
+                    except EOFError:
+                        # Worker crashed unexpectedly — log job and respawn worker
+                        bad_job = inflight.pop(wid, None)
+                        proc, old_conn = workers.pop(wid)
+                        conn_to_wid.pop(old_conn, None)
+                        kill_worker_group(proc, old_conn)
+                        if bad_job is not None:
+                            t_name, o_type, oid, _ = bad_job
+                            failed_jobs.append((t_name, o_type, oid, "Worker exited unexpectedly"))
+                            print(f"[ERROR] Worker {wid} crashed on {t_name}/{o_type} order {oid}.", flush=True)
+                        if job_idx < len(jobs):
+                            spawn_worker(wid)
+                            idle_wids.append(wid)
+                        break
+
+                    tag = msg[0]
+                    inflight.pop(wid, None)
+                    idle_wids.append(wid)
+                    if tag == "OK":
+                        _, _, t_name, o_type, oid, _ = msg
+                        completed_total += 1
+                        key = f"{t_name}/{o_type}"
+                        completed_by_test[key] = completed_by_test.get(key, 0) + 1
+                    elif tag == "ERR":
+                        _, _, t_name, o_type, oid, err_str, tb = msg
+                        failed_jobs.append((t_name, o_type, oid, err_str))
+                        print(f"[ERROR] {t_name}/{o_type} order {oid} failed:\n{tb}", flush=True)
+
+            # Check for dead inflight workers that closed without signalling
+            for wid in list(inflight.keys()):
+                proc, old_conn = workers[wid]
+                if not proc.is_alive() and not old_conn.poll():
+                    bad_job = inflight.pop(wid)
+                    workers.pop(wid)
+                    conn_to_wid.pop(old_conn, None)
+                    kill_worker_group(proc, old_conn)
+                    t_name, o_type, oid, _ = bad_job
+                    failed_jobs.append((t_name, o_type, oid, "Worker died unexpectedly"))
+                    print(f"[ERROR] Worker {wid} died on {t_name}/{o_type} order {oid}.", flush=True)
+                    if job_idx < len(jobs):
+                        spawn_worker(wid)
+                        idle_wids.append(wid)
+
+            dispatch_ready()
+            print_status(force=False)
+
+        # Graceful shutdown of persistent workers
+        for wid, (proc, conn) in list(workers.items()):
+            try:
+                conn.send(None)
+            except Exception:
+                pass
+        for wid, (proc, conn) in list(workers.items()):
+            proc.join(timeout=3.0)
+            if proc.is_alive():
+                kill_worker_group(proc, conn)
+            else:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        workers.clear()
+        conn_to_wid.clear()
+        print_status(force=True)
+
+    except KeyboardInterrupt:
+        interrupted = True
+        print(f"\n[INTERRUPT] Stopping {phase_label} cleanly — terminating all worker process groups...", flush=True)
+    finally:
+        if prev_sigterm is not None:
+            try:
+                signal.signal(signal.SIGTERM, prev_sigterm)
+            except (ValueError, OSError):
+                pass
+        for wid, (proc, conn) in list(workers.items()):
+            kill_worker_group(proc, conn)
+        workers.clear()
+        conn_to_wid.clear()
+
+    return {
+        'completed': completed_total,
+        'failed': failed_jobs,
+        'by_test': completed_by_test,
+        'interrupted': interrupted,
+    }
+
+
+def run_master_test_suite(
+    optg_given=None,
+    optg_test=None,
+    topx_given=None,
+    topx_test=None,
+    algo_given=None,
+    algo_test=None,
+    spee_given=None,
+    spee_test=None,
+    total_machine_cores=None,
+    mp_core_max=None,
+    criterion=DEFAULT_CRITERION,
+    metric=Metric.MAX_Z,
+    random_attempts=DEFAULT_MAX_ATTEMPTS,
+    bnb_topx=BNB_TOPX_DEFAULT_LIMIT,
+    save_given_pallets=False,
+    phase1_topx_max_boxes=22,
+    phase1_optg_max_boxes=19,
+    run_spee=True,
+    run_heavy_phase=True,
+    results_root="./results",
+    status_interval_seconds=30.0,
+):
+    """Master overnight test orchestrator for all 4 benchmark suites on both
+    given orders (1-40) and type-2 test orders (1000-3999).
+
+    Reads the missing-order lists from the Testing Area by default, skips any
+    order whose CSV is already present on disk, writes every CSV atomically
+    into the exact `./results/{test}_comparisons/{given,test}_orders/` folder
+    expected by `data_processing.ipynb`, and maximizes both 128-core CPU
+    utilization and CSV registration rate via a 3-phase pipeline:
+
+      Phase 1 — Unified High-Yield 1-Core Pool (100% of cores):
+        Runs all tractable `{algo, topx, optg}` jobs together across all cores,
+        starting with the fastest orders first for immediate CSV registration,
+        then scheduling the heavier Phase-1 tail orders longest-first so all
+        128 cores finish together with minimal drain idle time.
+
+      Phase 2 — Dedicated Multi-Core Speed Comparisons (`spee`):
+        Runs `spee` on missing test orders and given orders using the bounded-WIP
+        two-phase smart scheduler (`run_smart_concurrent_bnb_mc_speed_comparison`)
+        with pristine, uncontended timings across `1, 2, ..., mp_core_max` cores.
+
+      Phase 3 — Heavy / Exponential Unified 1-Core Pool (100% of cores):
+        Runs remaining deep `topx` (unlimited `topx=None` at 23+ boxes) and
+        exact `optg` (20+ boxes and given orders) strictly easiest-first across
+        all cores so exponential orders never block tractable results.
+    """
+    if optg_given is None:
+        optg_given = optg_missing_given_orders
+    if optg_test is None:
+        optg_test = optg_missing_test_orders
+    if topx_given is None:
+        topx_given = topx_missing_given_orders
+    if topx_test is None:
+        topx_test = topx_missing_test_orders
+    if algo_given is None:
+        algo_given = algo_missing_given_orders
+    if algo_test is None:
+        algo_test = algo_missing_test_orders
+    if spee_given is None:
+        spee_given = spee_missing_given_orders
+    if spee_test is None:
+        spee_test = spee_missing_test_orders
+
+    if total_machine_cores is None:
+        total_machine_cores = os.cpu_count() or DEFAULT_MP_CORES
+    total_machine_cores = max(1, int(total_machine_cores))
+    if mp_core_max is None:
+        mp_core_max = total_machine_cores
+
+    # Standard per-suite configs matching data_processing.ipynb expectations
+    suite_specs = [
+        ("algo", "given", algo_given, orders_dict, {
+            "output_dir": os.path.join(results_root, "algo_comparisons", "given_orders"),
+            "criterion": criterion, "metric": metric,
+            "save_pallets": save_given_pallets,
+            "random_attempts": random_attempts, "bnb_topx": bnb_topx,
+        }),
+        ("algo", "test", algo_test, test_orders_dict, {
+            "output_dir": os.path.join(results_root, "algo_comparisons", "test_orders"),
+            "criterion": criterion, "metric": metric,
+            "save_pallets": False,
+            "random_attempts": random_attempts, "bnb_topx": bnb_topx,
+        }),
+        ("topx", "given", topx_given, orders_dict, {
+            "output_dir": os.path.join(results_root, "topx_comparisons", "given_orders"),
+            "criterion": criterion,
+            "save_pallets": save_given_pallets,
+            "topx_min": 1, "topx_max": 5, "topx_step": 1, "topx_test_without": False,
+        }),
+        ("topx", "test", topx_test, test_orders_dict, {
+            "output_dir": os.path.join(results_root, "topx_comparisons", "test_orders"),
+            "criterion": criterion,
+            "save_pallets": False,
+            "topx_min": 1, "topx_max": 15, "topx_step": 1, "topx_test_without": True,
+        }),
+        ("optg", "given", optg_given, orders_dict, {
+            "output_dir": os.path.join(results_root, "optg_comparisons", "given_orders"),
+            "criterion": criterion, "metric": metric,
+            "save_pallets": save_given_pallets,
+        }),
+        ("optg", "test", optg_test, test_orders_dict, {
+            "output_dir": os.path.join(results_root, "optg_comparisons", "test_orders"),
+            "criterion": criterion, "metric": metric,
+            "save_pallets": False,
+        }),
+    ]
+
+    def get_box_count(order_type, oid):
+        od = orders_dict if order_type == "given" else test_orders_dict
+        return len(get_box_list_from_order(oid, od))
+
+    def difficulty_rank(test_name, order_type, oid):
+        n_boxes = get_box_count(order_type, oid)
+        if test_name == "algo":
+            return (float(n_boxes), 0, oid)
+        if test_name == "topx":
+            if order_type == "given":
+                return (float(n_boxes) + 3.0, 1, oid)
+            return (n_boxes * 1.45, 1, oid)
+        # optg (exact BnB grows steeply with box count)
+        return (n_boxes * 1.75, 2, oid)
+
+    phase1_fast = []
+    phase1_tail = []
+    phase3_heavy = []
+    skipped_summary = {}
+
+    for test_name, order_type, raw_ids, od, cfg in suite_specs:
+        os.makedirs(cfg["output_dir"], exist_ok=True)
+        seen = set()
+        skipped = 0
+        for oid in (raw_ids or []):
+            if oid in seen or oid not in od:
+                continue
+            seen.add(oid)
+            existing = _find_existing_test_csv(
+                test_name,
+                order_type,
+                oid,
+                cfg["output_dir"],
+                topx_min=cfg.get("topx_min", 1),
+                topx_max=cfg.get("topx_max", 15),
+                topx_step=cfg.get("topx_step", 1),
+            )
+            if existing is not None:
+                skipped += 1
+                continue
+
+            n_boxes = len(get_box_list_from_order(oid, od))
+            job = (test_name, order_type, oid, cfg)
+
+            if test_name == "algo":
+                if order_type == "test" and n_boxes <= 29:
+                    phase1_fast.append(job)
+                else:
+                    phase1_tail.append(job)
+            elif test_name == "topx":
+                if order_type == "given":
+                    phase1_tail.append(job)
+                elif n_boxes <= phase1_topx_max_boxes - 1:
+                    phase1_fast.append(job)
+                elif n_boxes <= phase1_topx_max_boxes:
+                    phase1_tail.append(job)
+                else:
+                    phase3_heavy.append(job)
+            elif test_name == "optg":
+                if order_type == "given":
+                    phase3_heavy.append(job)
+                elif n_boxes <= phase1_optg_max_boxes - 1:
+                    phase1_fast.append(job)
+                elif n_boxes <= phase1_optg_max_boxes:
+                    phase1_tail.append(job)
+                else:
+                    phase3_heavy.append(job)
+
+        skipped_summary[f"{test_name}/{order_type}"] = skipped
+
+    # Phase 1 order:
+    #   1) Easiest jobs ascending -> rapid initial CSV registration
+    #   2) Medium-hard Phase-1 tail jobs descending (LPT) -> heavy orders start
+    #      early enough that remaining medium orders fill all 128 cores until
+    #      Phase 1 finishes cleanly with minimal idle drain before Phase 2.
+    phase1_fast.sort(key=lambda j: difficulty_rank(j[0], j[1], j[2]))
+    phase1_tail.sort(key=lambda j: difficulty_rank(j[0], j[1], j[2]), reverse=True)
+    phase1_jobs = phase1_fast + phase1_tail
+
+    # Phase 3 order: strictly easiest-first so tractable frontier orders complete
+    # before multi-hour exponential orders ever occupy worker slots.
+    phase3_heavy.sort(key=lambda j: difficulty_rank(j[0], j[1], j[2]))
+
+    # Prepare Phase 2 (`spee`) lists sorted by box count ascending
+    spee_test_dir = os.path.join(results_root, "spee_comparisons", "test_orders")
+    spee_given_dir = os.path.join(results_root, "spee_comparisons", "given_orders")
+    spee_test_pending = sorted(
+        {oid for oid in (spee_test or []) if oid in test_orders_dict
+         and _find_existing_speed_csv(spee_test_dir, "T", oid) is None},
+        key=lambda oid: (len(get_box_list_from_order(oid, test_orders_dict)), oid),
+    )
+    spee_given_pending = sorted(
+        {oid for oid in (spee_given or []) if oid in orders_dict
+         and _find_existing_speed_csv(spee_given_dir, "O", oid) is None},
+        key=lambda oid: (len(get_box_list_from_order(oid, orders_dict)), oid),
+    )
+    skipped_summary["spee/test"] = len(set(spee_test or [])) - len(spee_test_pending)
+    skipped_summary["spee/given"] = len(set(spee_given or [])) - len(spee_given_pending)
+
+    master_start = time.monotonic()
+    print("=" * 100)
+    print("MASTER BENCHMARK SUITE ORCHESTRATOR (128-CORE HIGH-YIELD 3-PHASE EDITION)")
+    print(f"Machine Cores          : {total_machine_cores} (spee mp_core_max={mp_core_max})")
+    print(f"Phase 1 (Fast 1-core)  : {len(phase1_jobs):,} jobs (fast={len(phase1_fast):,}, LPT-tail={len(phase1_tail):,})")
+    print(f"Phase 2 (Speed MC)     : {len(spee_test_pending):,} test orders + {len(spee_given_pending):,} given orders (enabled={run_spee})")
+    print(f"Phase 3 (Heavy 1-core) : {len(phase3_heavy):,} jobs (enabled={run_heavy_phase})")
+    print(f"Already Completed      : {sum(skipped_summary.values()):,} CSVs skipped on disk")
+    print("=" * 100, flush=True)
+
+    summary = {
+        'phase1': None,
+        'phase2_test': None,
+        'phase2_given': None,
+        'phase3': None,
+        'skipped': skipped_summary,
+        'interrupted': False,
+    }
+
+    # --- PHASE 1 ---
+    if phase1_jobs:
+        res1 = _run_unified_single_core_pool(
+            "PHASE 1 (Tractable algo + topx + optg)",
+            phase1_jobs,
+            total_machine_cores=total_machine_cores,
+            status_interval_seconds=status_interval_seconds,
+        )
+        summary['phase1'] = res1
+        if res1['interrupted']:
+            summary['interrupted'] = True
+
+    # --- PHASE 2 ---
+    if run_spee and not summary['interrupted']:
+        if spee_test_pending:
+            print("\n" + "=" * 100)
+            print(f"MASTER SUITE — PHASE 2A (spee/test: {len(spee_test_pending):,} orders)")
+            print("=" * 100, flush=True)
+            res2t = run_smart_concurrent_bnb_mc_speed_comparison(
+                order_list=spee_test_pending,
+                mp_core_max=mp_core_max,
+                order_dict=test_orders_dict,
+                criterion=criterion,
+                metric=metric,
+                bnb_topx=bnb_topx,
+                output_dir=spee_test_dir,
+                total_machine_cores=total_machine_cores,
+                max_active_orders=None,
+                status_interval_seconds=status_interval_seconds,
+            )
+            summary['phase2_test'] = res2t
+            if res2t and res2t.get('interrupted'):
+                summary['interrupted'] = True
+
+        if spee_given_pending and not summary['interrupted']:
+            print("\n" + "=" * 100)
+            print(f"MASTER SUITE — PHASE 2B (spee/given: {len(spee_given_pending):,} orders)")
+            print("=" * 100, flush=True)
+            res2g = run_smart_concurrent_bnb_mc_speed_comparison(
+                order_list=spee_given_pending,
+                mp_core_max=mp_core_max,
+                order_dict=orders_dict,
+                criterion=criterion,
+                metric=metric,
+                bnb_topx=bnb_topx,
+                output_dir=spee_given_dir,
+                total_machine_cores=total_machine_cores,
+                max_active_orders=None,
+                status_interval_seconds=status_interval_seconds,
+            )
+            summary['phase2_given'] = res2g
+            if res2g and res2g.get('interrupted'):
+                summary['interrupted'] = True
+
+    # --- PHASE 3 ---
+    if run_heavy_phase and phase3_heavy and not summary['interrupted']:
+        res3 = _run_unified_single_core_pool(
+            "PHASE 3 (Deep topx + exact optg frontier)",
+            phase3_heavy,
+            total_machine_cores=total_machine_cores,
+            status_interval_seconds=status_interval_seconds,
+        )
+        summary['phase3'] = res3
+        if res3['interrupted']:
+            summary['interrupted'] = True
+
+    total_elapsed = time.monotonic() - master_start
+    total_completed = (
+        (summary['phase1']['completed'] if summary['phase1'] else 0)
+        + (summary['phase2_test']['completed'] if summary['phase2_test'] else 0)
+        + (summary['phase2_given']['completed'] if summary['phase2_given'] else 0)
+        + (summary['phase3']['completed'] if summary['phase3'] else 0)
+    )
+
+    print("\n" + "=" * 100)
+    if summary['interrupted']:
+        print("MASTER TEST SUITE STOPPED CLEANLY (resumable — re-run to continue from remaining orders).")
+    else:
+        print("MASTER TEST SUITE COMPLETED ALL REQUESTED PHASES!")
+    print(f"Total CSVs registered this session : {total_completed:,}")
+    print(f"Previously saved (skipped)         : {sum(skipped_summary.values()):,}")
+    print(f"Total elapsed wall-clock time      : {total_elapsed / 60.0:.2f} min ({total_elapsed:.1f}s)")
+    print("=" * 100, flush=True)
+    return summary
 
 
 # %% [markdown]
@@ -3632,23 +4335,41 @@ testing_optg_comparisons = False
 testing_topx_comparisons = False
 testing_algo_comparisons = False
 testing_speed_comparisons = False
-testing_smart_speed_comparisons = True
+testing_smart_speed_comparisons = False
+testing_master_suite = True
 
 given_order_list = list(range(1, 41))
 type_2_test_order_list = list(range(1000, 4000))
+reduced_type_2_test_order_list = list(range(1000, 3000))
 
-optg_missing_given_orders = [1, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40]
-optg_missing_test_orders = [2047, 2070, 2122, 2124, 2208, 2223, 2224, 2231, 2248, 2249, 2288, 2305, 2311, 2327, 2344, 2347, 2354, 2356, 2377, 2380, 2387, 2393, 2395, 2399, 2400, 2403, 2405, 2406, 2412, 2416, 2417, 2418, 2421, 2424, 2435, 2436, 2445, 2448, 2455, 2462, 2463, 2465, 2476, 2483, 2490, 2491, 2497, 2505, 2507, 2511, 2514, 2515, 2516, 2520, 2521, 2523, 2525, 2526, 2528, 2529, 2533, 2534, 2535, 2539, 2541, 2542, 2545, 2548, 2549, 2552, 2554, 2558, 2561, 2562, 2563, 2570, 2575, 2581, 2584, 2591, 2592, 2593, 2596, 2600, 2601, 2602, 2603, 2604, 2609, 2613, 2614, 2615, 2617, 2618, 2619, 2620, 2621, 2622, 2623, 2624, 2626, 2627, 2628, 2630, 2631, 2632, 2633, 2634, 2635, 2636, 2637, 2638, 2639, 2640, 2641, 2642, 2643, 2644, 2645, 2646, 2647, 2648, 2649, 2650, 2651, 2652, 2653, 2654, 2655, 2656, 2657, 2658, 2659, 2660, 2661, 2662, 2663, 2664, 2665, 2666, 2667, 2668, 2669, 2670, 2671, 2672, 2673, 2674, 2675, 2676, 2677, 2678, 2679, 2680, 2681, 2682, 2683, 2684, 2685, 2686, 2687, 2688, 2689, 2690, 2691, 2692, 2693, 2694, 2695, 2696, 2697, 2698, 2699, 2700, 2701, 2702, 2703, 2704, 2705, 2706, 2707, 2708, 2709, 2710, 2711, 2712, 2713, 2714, 2715, 2716, 2717, 2718, 2719, 2720, 2721, 2722, 2723, 2724, 2725, 2726, 2727, 2728, 2729, 2730, 2731, 2732, 2733, 2734, 2735, 2736, 2737, 2738, 2739, 2740, 2741, 2742, 2743, 2744, 2745, 2746, 2747, 2748, 2749, 2750, 2751, 2752, 2753, 2754, 2755, 2756, 2757, 2758, 2759, 2760, 2761, 2762, 2763, 2764, 2765, 2766, 2767, 2768, 2769, 2770, 2771, 2772, 2773, 2774, 2775, 2776, 2777, 2778, 2779, 2780, 2781, 2782, 2783, 2784, 2785, 2786, 2787, 2788, 2789, 2790, 2791, 2792, 2793, 2794, 2795, 2796, 2797, 2798, 2799, 2800, 2801, 2802, 2803, 2804, 2805, 2806, 2807, 2808, 2809, 2810, 2811, 2812, 2813, 2814, 2815, 2816, 2817, 2818, 2819, 2820, 2821, 2822, 2823, 2824, 2825, 2826, 2827, 2828, 2829, 2830, 2831, 2832, 2833, 2834, 2835, 2836, 2837, 2838, 2839, 2840, 2841, 2842, 2843, 2844, 2845, 2846, 2847, 2848, 2849, 2850, 2851, 2852, 2853, 2854, 2855, 2856, 2857, 2858, 2859, 2860, 2861, 2862, 2863, 2864, 2865, 2866, 2867, 2868, 2869, 2870, 2871, 2872, 2873, 2874, 2875, 2876, 2877, 2878, 2879, 2880, 2881, 2882, 2883, 2884, 2885, 2886, 2887, 2888, 2889, 2890, 2891, 2892, 2893, 2894, 2895, 2896, 2897, 2898, 2899, 2900, 2901, 2902, 2903, 2904, 2905, 2906, 2907, 2908, 2909, 2910, 2911, 2912, 2913, 2914, 2915, 2916, 2917, 2918, 2919, 2920, 2921, 2922, 2923, 2924, 2925, 2926, 2927, 2928, 2929, 2930, 2931, 2932, 2933, 2934, 2935, 2936, 2937, 2938, 2939, 2940, 2941, 2942, 2943, 2944, 2945, 2946, 2947, 2948, 2949, 2950, 2951, 2952, 2953, 2954, 2955, 2956, 2957, 2958, 2959, 2960, 2961, 2962, 2963, 2964, 2965, 2966, 2967, 2968, 2969, 2970, 2971, 2972, 2973, 2974, 2975, 2976, 2977, 2978, 2979, 2980, 2981, 2982, 2983, 2984, 2985, 2986, 2987, 2988, 2989, 2990, 2991, 2992, 2993, 2994, 2995, 2996, 2997, 2998, 2999]
-topx_missing_given_orders = [37]
-topx_missing_test_orders = [2122, 2143, 2189, 2207, 2224, 2249, 2256, 2283, 2288, 2297, 2305, 2311, 2327, 2347, 2354, 2356, 2386, 2399, 2400, 2402, 2403, 2405, 2416, 2417, 2418, 2421, 2435, 2436, 2445, 2448, 2455, 2461, 2462, 2465, 2491, 2497, 2505, 2507, 2520, 2533, 2535, 2539, 2541, 2549, 2552, 2554, 2558, 2561, 2562, 2570, 2582, 2584, 2593, 2596, 2609, 2611, 2612, 2618, 2622, 2636, 2637, 2640, 2641, 2642, 2646, 2647, 2651, 2657, 2659, 2661, 2662, 2669, 2675, 2683, 2685, 2687, 2688, 2690, 2693, 2697, 2698, 2707, 2708, 2709, 2712, 2717, 2718, 2719, 2723, 2726, 2728, 2729, 2731, 2734, 2735, 2736, 2737, 2738, 2739, 2741, 2743, 2744, 2746, 2752, 2754, 2755, 2760, 2762, 2768, 2771, 2772, 2773, 2782, 2785, 2788, 2789, 2790, 2791, 2795, 2798, 2799, 2800, 2801, 2803, 2804, 2806, 2809, 2811, 2812, 2816, 2819, 2820, 2821, 2826, 2827, 2829, 2831, 2832, 2833, 2834, 2835, 2836, 2839, 2842, 2843, 2844, 2845, 2853, 2857, 2858, 2860, 2862, 2863, 2864, 2866, 2869, 2871, 2874, 2875, 2880, 2881, 2886, 2888, 2889, 2893, 2896, 2898, 2899, 2900, 2901, 2903, 2904, 2906, 2907, 2908, 2909, 2911, 2912, 2914, 2915, 2917, 2919, 2920, 2921, 2922, 2923, 2926, 2927, 2929, 2931, 2934, 2935, 2938, 2939, 2940, 2943, 2945, 2946, 2947, 2949, 2952, 2953, 2954, 2955, 2957, 2958, 2959, 2960, 2962, 2963, 2965, 2966, 2970, 2971, 2972, 2973, 2974, 2975, 2980, 2981, 2982, 2986, 2987, 2989, 2991, 2993, 2994, 2995, 2996, 2997, 2999]
-algo_missing_given_orders = [37]
-algo_missing_test_orders = [3871, 3922, 3959]
-spee_missing_given_orders = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40]
+optg_missing_given_orders = given_order_list
+optg_missing_test_orders = type_2_test_order_list
+topx_missing_given_orders = given_order_list
+topx_missing_test_orders = type_2_test_order_list
+algo_missing_given_orders = given_order_list
+algo_missing_test_orders = type_2_test_order_list
+spee_missing_given_orders = given_order_list
 spee_missing_test_orders = type_2_test_order_list
 
 if __name__ == "__main__":
     if NOTEBOOK_MODE:
-        if testing_speed_comparisons:
+        if testing_master_suite:
+            run_master_test_suite(
+                optg_given=optg_missing_given_orders,
+                optg_test=optg_missing_test_orders,
+                topx_given=topx_missing_given_orders,
+                topx_test=topx_missing_test_orders,
+                algo_given=algo_missing_given_orders,
+                algo_test=algo_missing_test_orders,
+                spee_given=spee_missing_given_orders,
+                spee_test=spee_missing_test_orders,
+                total_machine_cores=DEFAULT_MP_CORES,
+                mp_core_max=DEFAULT_MP_CORES,
+                criterion=DEFAULT_CRITERION,
+                metric=Metric.MAX_Z,
+                bnb_topx=BNB_TOPX_DEFAULT_LIMIT,
+            )
+        elif testing_speed_comparisons:
             run_bnb_mc_speed_comparison(DEFAULT_MP_CORES, 2000, 2099, test_orders_dict, DEFAULT_CRITERION, Metric.MAX_Z, False)
         elif testing_smart_speed_comparisons:
             run_smart_concurrent_bnb_mc_speed_comparison(
@@ -3668,6 +4389,23 @@ if __name__ == "__main__":
         else:
             testpallet, nodes = process_order(current_orderID, algo=current_algo, criterion=current_criterion, order_dict=current_order_dict, metric=current_metric)
             testpallet.get_pallet_results(current_algo, current_orderID, current_order_dict, print_mode=True, nodes=nodes)
+
+    elif testing_master_suite:
+        run_master_test_suite(
+            optg_given=optg_missing_given_orders,
+            optg_test=optg_missing_test_orders,
+            topx_given=topx_missing_given_orders,
+            topx_test=topx_missing_test_orders,
+            algo_given=algo_missing_given_orders,
+            algo_test=algo_missing_test_orders,
+            spee_given=spee_missing_given_orders,
+            spee_test=spee_missing_test_orders,
+            total_machine_cores=DEFAULT_MP_CORES,
+            mp_core_max=DEFAULT_MP_CORES,
+            criterion=DEFAULT_CRITERION,
+            metric=Metric.MAX_Z,
+            bnb_topx=BNB_TOPX_DEFAULT_LIMIT,
+        )
 
     elif testing_random_fulfillment:
         run_random_fulfillment_test(1000, 3999, test_orders_dict, 500, 10000, 100, True)

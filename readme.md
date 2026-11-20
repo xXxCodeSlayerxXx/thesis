@@ -156,6 +156,7 @@ Six experiment drivers live in the optimizer notebook/script. Analysis and figur
 | `run_algorithm_comparison_test` | Random / FFD / BFD / BnB head-to-head | `results/algo_comparisons/` |
 | `run_bnb_mc_speed_comparison` | Sequential single-core vs. multi-core BnB scaling & exactness | `results/spee_comparisons/` |
 | `run_smart_concurrent_bnb_mc_speed_comparison` | Overnight multi-order scheduler targeting ~100% core use | `results/spee_comparisons/test_orders/` |
+| `run_master_test_suite` | 3-phase overnight orchestrator running all 4 test suites on missing given & test orders | `results/{algo,topx,optg,spee}_comparisons/{given,test}_orders/` |
 
 The overnight smart scheduler (`run_smart_concurrent_bnb_mc_speed_comparison`) is built for shared high-core-count compute servers:
 
@@ -248,7 +249,7 @@ Defined near the top of the optimizer:
 
 ### Batch experiments
 
-Flags in the testing cell (`testing_random_fulfillment`, `testing_optg_comparisons`, `testing_topx_comparisons`, `testing_algo_comparisons`, `testing_speed_comparisons`, `testing_smart_speed_comparisons`) run the corresponding driver. The comparison tests can be dispatched with `ProcessPoolExecutor` over missing order IDs, while `testing_smart_speed_comparisons` uses `run_smart_concurrent_bnb_mc_speed_comparison` to run missing orders overnight across all power-of-two core counts.
+Flags in the testing cell (`testing_random_fulfillment`, `testing_optg_comparisons`, `testing_topx_comparisons`, `testing_algo_comparisons`, `testing_speed_comparisons`, `testing_smart_speed_comparisons`, `testing_master_suite`) run the corresponding driver. Setting `testing_master_suite = True` runs `run_master_test_suite()` across all 8 missing-order lists in three phases (fast unified `algo`/`topx`/`optg` pool → dedicated `spee` multi-core scaling → deep exponential `topx`/`optg` frontier), skipping any CSVs already saved on disk.
 
 After a batch, run the concatenation / missing-order / plotting cells in `data_processing.ipynb`.
 
