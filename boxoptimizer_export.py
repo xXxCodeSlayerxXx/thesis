@@ -28,6 +28,7 @@ from enum import Enum
 import concurrent.futures
 import multiprocessing as mp
 import matplotlib.pyplot as plt
+from operator import itemgetter
 from multiprocessing.connection import wait as mp_wait
 
 NOTEBOOK_MODE = hasattr(sys, 'ps1')                                             # Detect whether diplay modules are to be loaded for notebook or terminal running (trick from https://stackoverflow.com/questions/1212779/detecting-when-a-python-script-is-being-run-interactively-in-ipython)
@@ -63,6 +64,7 @@ class Algorithm(Enum):                                                          
     BNB = "bnb"
 
 _BNB_MC_CONTEXT = None                                                          # Read-only context inherited copy-on-write by forked BnB workers
+_FIRST_ITEM = itemgetter(0)
 
 MAXIMIZE_METRICS = [Metric.PACKING_SCORE, Metric.VOLUME_UTILIZATION]            # Define which metrics should be maximized vs minimized (higher is better vs lower is better)
 MINIMIZE_METRICS = [Metric.COG_Z, Metric.MAX_Z]
@@ -127,30 +129,59 @@ class Pallet:
         self.size_x, self.size_y, self.size_z = dims
         # Initialize list to store boxes placed on the pallet
         self.boxes = []
-        # Initialize heightmap to track box heights at each (x, y) position
-        self.heightmap = np.zeros((self.size_x, self.size_y), dtype=np.int32)
-        # Initialize sets candidate coordinates (existing box edges) for all potential placements
+        # Compact tuple list (x, y, x2, y2, top_z) for exact O(k) geometric queries
+        self._box_rects = []
+        # Lazy heightmap materialized on demand (avoids 5.6 MB array scans/copies during search)
+        self._heightmap = None
+        self._heightmap_dirty = True
+        self._custom_heightmap = False
+        self._has_zero_height_box = False
+        # Initialize sets of candidate coordinates (existing box edges) for all potential placements
         self.candidates_x = {0}
         self.candidates_y = {0}
         # Initialize set of candidate coordinate pairs at corner points to optimize placement (in corners between boxes)
         self.extpts = {(0, 0)}
-        # Initialize total occupied volume under heightmap counter (boxes + wasted volume)
-        self.heightmap_sum = 0
         # Initialize storage of max Z
         self.max_z = 0
 
-    def reset(self):                                                            # Emtpy the pallet
-        # Clear the list of boxes
+    @property
+    def heightmap(self):                                                        # Materialize exact int32 heightmap lazily on access
+        if self._heightmap is None:
+            self._heightmap = np.zeros((self.size_x, self.size_y), dtype=np.int32)
+            if self._box_rects:
+                for bx, by, bx2, by2, btop in self._box_rects:
+                    self._heightmap[bx:bx2, by:by2] = btop
+            self._heightmap_dirty = False
+        elif self._heightmap_dirty:
+            self._heightmap.fill(0)
+            for bx, by, bx2, by2, btop in self._box_rects:
+                self._heightmap[bx:bx2, by:by2] = btop
+            self._heightmap_dirty = False
+        return self._heightmap
+
+    @heightmap.setter
+    def heightmap(self, value):                                                 # Preserve compatibility if caller assigns heightmap directly
+        self._heightmap = value
+        self._heightmap_dirty = False
+        self._custom_heightmap = True
+
+    @property
+    def heightmap_sum(self):                                                    # Total occupied volume under heightmap (computed lazily)
+        return int(np.sum(self.heightmap))
+
+    def reset(self):                                                            # Empty the pallet
+        # Clear the list of boxes and compact geometric index
         self.boxes = []
-        # Reset the heightmap to all zeros
-        self.heightmap = np.zeros((self.size_x, self.size_y), dtype=np.int32)
+        self._box_rects = []
+        # Mark heightmap dirty without reallocating a 5.6 MB array
+        self._heightmap_dirty = True
+        self._custom_heightmap = False
+        self._has_zero_height_box = False
         # Reset sets of candidate coordinates
         self.candidates_x = {0}
         self.candidates_y = {0}
         # Reset set of extreme points
         self.extpts = {(0, 0)}
-        # Reset occupied volume counter
-        self.heightmap_sum = 0
         # Reset storage of max Z
         self.max_z = 0
 
@@ -166,122 +197,173 @@ class Pallet:
                 return True
         return False
 
-    def check_box_placement_validity(self, box_dims, x, y):                     # Check if a box of given dimensions may be placed at position (x, y) on the pallet
-        # Unpack box dimensions
+    def get_valid_placement_z(self, box_dims, x, y):                            # Exact O(k) placement check: returns landing z-height if valid, else -1
         dx, dy, dz = box_dims
+        x2 = x + dx
+        y2 = y + dy
 
-        # Get the height the bottom of the box will rest on
-        z = self.get_max_height_in_area(x, y, dx, dy)
+        # Fast bounds rejection before scanning placed boxes
+        if x < 0 or y < 0 or dx <= 0 or dy <= 0 or x2 > self.size_x or y2 > self.size_y:
+            return -1
+
+        # Exact numpy fallback only if caller manually replaced heightmap or placed a 0-height box
+        if self._custom_heightmap or self._has_zero_height_box:
+            z = self.get_max_height_in_area(x, y, dx, dy)
+            if z == -1 or z + dz > self.size_z:
+                return -1
+            area_supported = int(np.sum(self.heightmap[x:x2, y:y2] == z))
+            if (area_supported / (dx * dy)) * 100 < SUPPORTED_AREA_PERCENTAGE:
+                return -1
+            return z
+
+        # Single O(k) pass over placed boxes computes BOTH landing height z AND exact
+        # supported area simultaneously. Because heights increase strictly monotonically
+        # on placement (dz > 0), all placed boxes sharing the same top height btop == z
+        # are pairwise disjoint in (x, y), so their overlap areas sum directly with zero
+        # double-counting and exact integer equivalence to np.sum(heightmap == z).
+        max_allowed_z = self.size_z - dz
+        if max_allowed_z < 0:
+            return -1
+
+        z = 0
+        area_supported = 0
+        for bx, by, bx2, by2, btop in self._box_rects:
+            if bx < x2 and x < bx2 and by < y2 and y < by2:
+                if btop > z:
+                    if btop > max_allowed_z:
+                        return -1
+                    z = btop
+                    ox = (x2 if x2 < bx2 else bx2) - (x if x > bx else bx)
+                    oy = (y2 if y2 < by2 else by2) - (y if y > by else by)
+                    area_supported = ox * oy
+                elif btop == z:
+                    ox = (x2 if x2 < bx2 else bx2) - (x if x > bx else bx)
+                    oy = (y2 if y2 < by2 else by2) - (y if y > by else by)
+                    area_supported += ox * oy
+
+        if z == 0:
+            return 0 if 100 >= SUPPORTED_AREA_PERCENTAGE else -1
+
+        if (area_supported / (dx * dy)) * 100 < SUPPORTED_AREA_PERCENTAGE:
+            return -1
+
+        return z
+
+    def check_box_placement_validity(self, box_dims, x, y):                     # Check if a box of given dimensions may be placed at position (x, y) on the pallet
+        return self.get_valid_placement_z(box_dims, x, y) != -1
+
+    def place_box(self, box_dims, x, y):                                        # Attempt to place a box of given dimensions at (x, y) position on the pallet. Return a delta (dict of information to reverse move) if successful, False if not.
+        # Unpack box dimensions and validate placement + compute landing z in one pass
+        dx, dy, dz = box_dims
+        z = self.get_valid_placement_z(box_dims, x, y)
         if z == -1:
             return False
 
-        # Check if the box fits within the pallet boundaries, or return False
-        if not self.get_in_bounds_status(x+dx, y+dy, z+dz):
-            return False
-
-        # Check if there is enough support under the box, or return False
-        box_area = dx * dy
-        area_supported = np.sum(self.heightmap[x:x+dx, y:y+dy] == z)
-        support_percentage = (area_supported / box_area) * 100
-        if support_percentage < SUPPORTED_AREA_PERCENTAGE:
-            return False
-        
-        return True
-
-    def place_box(self, box_dims, x, y):                                        # Attempt to place a box of given dimensions at (x, y) position on the pallet. Return a delta (dict of information to reverse move) if successful, False if not.
-        # Unpack box dimensions and get z value to place it at
-        dx, dy, dz = box_dims
-        z = self.get_max_height_in_area(x, y, dx, dy)
-
-        # Check box placement prerequisites, fail if not met
-        if not self.check_box_placement_validity(box_dims, x, y):
-            return False
-        
-        # Save a 'before' snapshot of changed part of the heightmap for delta
-        heightmap_backup = self.heightmap[x:x+dx, y:y+dy].copy()
+        x2 = x + dx
+        y2 = y + dy
+        top_z = z + dz
 
         # Check if we will be adding new candidate coordinates by placing this box
-        adding_candidate_x = (x + dx < self.size_x) and ((x + dx) not in self.candidates_x)
-        adding_candidate_y = (y + dy < self.size_y) and ((y + dy) not in self.candidates_y)
+        adding_candidate_x = (x2 < self.size_x) and (x2 not in self.candidates_x)
+        adding_candidate_y = (y2 < self.size_y) and (y2 not in self.candidates_y)
 
-        # Compute change in local part of heightmap by placing box
-        old_local_sum = int(np.sum(heightmap_backup))
-        new_local_sum = dx * dy * (z + dz)
-        heightmap_sum_delta = new_local_sum - old_local_sum
-        
-        # Place the box: update the heightmap and max z (if it is increased) and store the dimensions in the boxlist
-        self.heightmap[x:x+dx, y:y+dy] = z + dz
-        self.heightmap_sum += heightmap_sum_delta
-        self.max_z = max(self.max_z, z + dz)
+        # Save lightweight rollback state (O(1) for max_z and extpts)
+        prev_max_z = self.max_z
+        prev_extpts = self.extpts
+        prev_zero_flag = self._has_zero_height_box
+        heightmap_backup = None
+        if self._custom_heightmap:
+            heightmap_backup = self._heightmap[x:x2, y:y2].copy()
+            self._heightmap[x:x2, y:y2] = top_z
+        else:
+            self._heightmap_dirty = True
+
+        if dz <= 0:
+            self._has_zero_height_box = True
+
+        # Place the box: update max_z, box list, and compact geometric index
+        if top_z > self.max_z:
+            self.max_z = top_z
         self.boxes.append({
             'x': x, 'y': y, 'z': z, 'dx': dx, 'dy': dy, 'dz': dz
         })
+        self._box_rects.append((x, y, x2, y2, top_z))
 
         # Add box edges to candidate coordinate lists if prerequisites are met
-        if adding_candidate_x: self.candidates_x.add(x + dx)
-        if adding_candidate_y: self.candidates_y.add(y + dy)
+        if adding_candidate_x: self.candidates_x.add(x2)
+        if adding_candidate_y: self.candidates_y.add(y2)
 
-        # Save old set of extreme points calculate the post-move set
-        old_extpts = self.extpts.copy()
+        # Calculate the post-move extreme points (creates a fresh set, leaving prev_extpts intact)
         self.calculate_extreme_points()
 
         # Put together all the information needed to reverse this move in a delta dict
         delta = {
-            'x': x, 
+            'x': x,
             'y': y,
             'z': z,
-            'dx': dx, 
+            'dx': dx,
             'dy': dy,
             'dz': dz,
+            'prev_max_z': prev_max_z,
+            'prev_extpts': prev_extpts,
+            'prev_zero_flag': prev_zero_flag,
             'heightmap_backup': heightmap_backup,
-            'heightmap_sum_delta': heightmap_sum_delta,
             'x_candidate_added': adding_candidate_x,
             'y_candidate_added': adding_candidate_y,
-            'added_extpts': self.extpts.difference(old_extpts),
-            'removed_extpts': old_extpts.difference(self.extpts)
         }
 
         # Return delta to indicate successful placement
         return delta
     
     def remove_box(self, delta):                                                # Remove a box based on the information in the given delta dict
-        # Load values from delta dict
         x, y, dx, dy = delta['x'], delta['y'], delta['dx'], delta['dy']
-        self.heightmap[x:x+dx, y:y+dy] = delta['heightmap_backup']
 
-        # Revert change to heightmap sum
-        self.heightmap_sum -= delta['heightmap_sum_delta']
+        if delta['heightmap_backup'] is not None:
+            self._heightmap[x:x+dx, y:y+dy] = delta['heightmap_backup']
+        else:
+            self._heightmap_dirty = True
 
-        # Recompute max_z if removed box was the tallest one
-        if delta['z'] + delta['dz'] >= self.max_z:
-            self.max_z = np.max(self.heightmap)
+        # Restore max_z and zero-height flag in O(1)
+        self.max_z = delta['prev_max_z']
+        self._has_zero_height_box = delta['prev_zero_flag']
         
-        # Remove the last box off the list
+        # Remove the last box off the list and geometric index
         self.boxes.pop()
+        self._box_rects.pop()
         
         # Remove candidate coordinates if they were added by this move
         if delta['x_candidate_added']: self.candidates_x.remove(x + dx)
         if delta['y_candidate_added']: self.candidates_y.remove(y + dy)
 
-        # Revert extreme points set with information from delta: remove added points, and restore removed points
-        self.extpts = self.extpts.difference(delta['added_extpts'])
-        self.extpts = self.extpts.union(delta['removed_extpts'])
+        # Restore previous extreme points set in O(1)
+        self.extpts = delta['prev_extpts']
 
     # Pallet state and analysis methods    
     def get_max_height_in_area(self, x, y, dx, dy):                             # Get the maximum height in a rectangular area of the heightmap
-        # Ensure we don't go out of bounds
-        x_end = min(x + dx, self.size_x)                                          
-        y_end = min(y + dy, self.size_y)
+        if self._custom_heightmap or x < 0 or y < 0:
+            x_end = min(x + dx, self.size_x)
+            y_end = min(y + dy, self.size_y)
+            region = self.heightmap[x:x_end, y:y_end]
+            if region.size <= 0:
+                return -1
+            return int(np.max(region))
 
-        # Specify the rectangle being checked
-        region = self.heightmap[x:x_end, y:y_end]
+        x_end = x + dx
+        if x_end > self.size_x:
+            x_end = self.size_x
+        y_end = y + dy
+        if y_end > self.size_y:
+            y_end = self.size_y
 
-        # Return -1 (fail) if the region is of size 0 or smaller
-        if region.size <= 0:
+        if x >= x_end or y >= y_end:
             return -1
-        
-        # Otherwise, return the maximum height in the region
-        return np.max(region)
+
+        max_h = 0
+        for bx, by, bx2, by2, btop in self._box_rects:
+            if bx < x_end and x < bx2 and by < y_end and y < by2:
+                if btop > max_h:
+                    max_h = btop
+        return max_h
     
     def count_boxes(self):                                                      # Return the number of boxes currently on the pallet
         return len(self.boxes)
@@ -304,39 +386,32 @@ class Pallet:
         return round(used_area_acc / total_area * 100, 2)
 
     def calculate_extreme_points(self):                                         # Calculate the set of extreme points (corners of the top layer of boxes) for use as candidate placements
-        # Start with the origin as an extreme point
-        new_extpts = {(0, 0)} 
-    
-        for box in self.boxes:
-            # Allow stacking boxes on top of each other by including the top corners of boxes as extreme points
-            new_extpts.add((box['x'], box['y']))
+        size_x = self.size_x
+        size_y = self.size_y
+        rects = self._box_rects
+        new_extpts = {(0, 0)}
 
-            # Find existing box edges to use as starting points for projections
-            x_end = box['x'] + box['dx']
-            y_end = box['y'] + box['dy']
-            
-            # Trace right edge to Y=0 (find max Y of boxes behind it)
+        for bx, by, x_end, y_end, _ in rects:
+            # Allow stacking boxes on top of each other by including the top corners of boxes as extreme points
+            if 0 <= bx <= size_x and 0 <= by <= size_y:
+                new_extpts.add((bx, by))
+
+            # Trace right edge to Y=0 and front edge to X=0 in a single pass
             y_projection_dist = 0
-            for other in self.boxes:
-                # If the other box is strictly behind right edge, and overlaps in X dimension, and is further to the back, overwrite projection distance
-                if other['y'] + other['dy'] <= box['y'] and other['x'] < x_end < other['x'] + other['dx']:
-                    y_projection_dist = max(y_projection_dist, other['y'] + other['dy'])
-            # Add the point at the end of the right edge and its projection back to Y=0 as extreme point
-            new_extpts.add((x_end, y_projection_dist))
-            
-            # Trace front edge to X=0 (find max X of boxes to the left of it)
             x_projection_dist = 0
-            for other in self.boxes:
-                # If the other box is strictly to the left of front edge, and overlaps in Y dimension, and is further to the left, overwrite projection distance
-                if other['x'] + other['dx'] <= box['x'] and other['y'] < y_end < other['y'] + other['dy']:
-                    x_projection_dist = max(x_projection_dist, other['x'] + other['dx'])
-            # Add the point at the end of the front edge and its projection back to X=0 as extreme point
-            new_extpts.add((x_projection_dist, y_end))
-        
-        # Remove any points that are out of bounds and set as new extreme points
-        for x, y, in new_extpts.copy():
-            if x < 0 or y < 0 or x > self.size_x or y > self.size_y:
-                new_extpts.remove((x, y))
+            for ox, oy, ox2, oy2, _ in rects:
+                if oy2 <= by and ox < x_end < ox2:
+                    if oy2 > y_projection_dist:
+                        y_projection_dist = oy2
+                if ox2 <= bx and oy < y_end < oy2:
+                    if ox2 > x_projection_dist:
+                        x_projection_dist = ox2
+
+            if 0 <= x_end <= size_x and 0 <= y_projection_dist <= size_y:
+                new_extpts.add((x_end, y_projection_dist))
+            if 0 <= x_projection_dist <= size_x and 0 <= y_end <= size_y:
+                new_extpts.add((x_projection_dist, y_end))
+
         self.extpts = new_extpts
 
     # Pallet metrics and visualization methods
@@ -628,6 +703,14 @@ class Pallet:
         return (fulfillment, volume_util, area_usage_at_z0, cog_z, packing_score, max_z)
 
     def simulate_placement(self, x, y, box_dims, requested_metric=Metric.ALL):  # Simulate a box placement on a pallet and return either a specific metric or a dictionary of all metrics from the result
+        # Fast exact path for MAX_Z: no need to mutate boxes or recompute extreme points
+        if requested_metric == Metric.MAX_Z:
+            z = self.get_valid_placement_z(box_dims, x, y)
+            if z == -1:
+                return -1
+            top_z = z + box_dims[2]
+            return top_z if top_z > self.max_z else self.max_z
+
         # Place the box and get a delta to reverse the move after scoring
         delta = self.place_box(box_dims, x, y)
         
@@ -883,16 +966,23 @@ def _bnb_spikes_disproved_by_front(spikes, cert_front):
     """Return True iff `cert_front` already proves an ancestor spike was pruned by Rule 4."""
     return _bnb_first_disproved_spike_depth(spikes, cert_front) is not None
 
-def _bnb_compute_rule4_min_z(pallet, tallest_orientations):
-    """Exact Rule 4 (tall-low) minimum landing height matching single-core BnB."""
+def _bnb_compute_rule4_min_z(pallet, tallest_orientations, early_exit_threshold=-1):
+    """Exact Rule 4 (tall-low) minimum landing height matching single-core BnB.
+
+    If `early_exit_threshold >= 0`, stops as soon as any valid placement achieves
+    `top_z <= early_exit_threshold` (guaranteed neither to prune nor to spike).
+    """
     min_landing_z = pallet.size_z + 100
+    get_valid_z = pallet.get_valid_placement_z
     for x, y in pallet.extpts:
         for dims in tallest_orientations:
-            if pallet.check_box_placement_validity(dims, x, y):
-                landing_z = pallet.get_max_height_in_area(x, y, dims[0], dims[1])
+            landing_z = get_valid_z(dims, x, y)
+            if landing_z != -1:
                 top_z = landing_z + dims[2]
                 if top_z < min_landing_z:
                     min_landing_z = top_z
+                    if top_z <= early_exit_threshold:
+                        return min_landing_z
     return min_landing_z
 
 def _bnb_generate_valid_children(pallet, box_index, current_sequence,
@@ -903,7 +993,7 @@ def _bnb_generate_valid_children(pallet, box_index, current_sequence,
 
     Applies the exact same candidate generation, top-X sorting/slicing,
     deduplication (Filter 1), and symmetry breaking (Filter 2) order as
-    `place_box_list_branch_and_bound()`, returning `[(child_idx, (dims, x, y)), ...]`.
+    `place_box_list_branch_and_bound()`, returning `[(child_idx, (dims, x, y), top_z), ...]`.
     """
     boxid = sorted_box_list[box_index]
     orientations = box_orientations_dict[boxid]
@@ -916,15 +1006,17 @@ def _bnb_generate_valid_children(pallet, box_index, current_sequence,
         symmetry_key = None
 
     candidate_placements = []
+    get_valid_z = pallet.get_valid_placement_z
     for dims in orientations:
+        dz = dims[2]
         for x, y in sorted_extpts:
-            if pallet.check_box_placement_validity(dims, x, y):
-                landing_z = pallet.get_max_height_in_area(x, y, dims[0], dims[1])
-                top_z = landing_z + dims[2]
+            landing_z = get_valid_z(dims, x, y)
+            if landing_z != -1:
+                top_z = landing_z + dz
                 candidate_placements.append(((top_z, x + y), dims, x, y, landing_z))
 
     if not use_guarantee and num_extpts_to_try is not None:
-        candidate_placements.sort(key=lambda c: c[0])
+        candidate_placements.sort(key=_FIRST_ITEM)
         filtered = max(0, len(candidate_placements) - num_extpts_to_try)
         candidate_placements = candidate_placements[:num_extpts_to_try]
         if filtered > 0:
@@ -1069,8 +1161,11 @@ def _bnb_mc_worker_main(worker_id, worker_conn, shared_split_tokens,
                     return None
 
                 # Rule 4 (Tall-Low Bounding)
+                # Can early-exit once any valid placement has top_z <= cur_max_z
+                # and top_z < r4_limit (neither prunes nor creates a Rule-4 spike).
+                r4_early_exit = cur_max_z if cur_max_z < r4_limit else (r4_limit - 1)
                 min_landing_z = int(_bnb_compute_rule4_min_z(
-                    pallet, tallest_remaining_orientations[b_idx]
+                    pallet, tallest_remaining_orientations[b_idx], r4_early_exit
                 ))
                 if size_z_plus_100 > min_landing_z >= r4_limit:
                     counts['pruned_rule4'] += 1
@@ -1314,7 +1409,7 @@ def _bnb_mc_verify_anomalous_candidates(pallet_dims, sorted_box_list, use_guaran
             return
 
         min_landing_z = _bnb_compute_rule4_min_z(
-            pallet, tallest_remaining_orientations[b_idx]
+            pallet, tallest_remaining_orientations[b_idx], best_score - 1
         )
         if size_z_plus_100 > min_landing_z >= best_score:
             return
@@ -1754,12 +1849,19 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
         # Rule 4 (Tall-Low)
         t_orientations = tallest_remaining_orientations[box_index]                                          # Check if tallest remaining box placed at its lowest possible candidate position exceeds best_score and prune if so
         min_landing_z = PALLET_DIMS[2] + 100
+        get_valid_z = pallet.get_valid_placement_z
         
         for x, y in pallet.extpts:
             for dims in t_orientations:
-                if pallet.check_box_placement_validity(dims, x, y):
-                    landing_z = pallet.get_max_height_in_area(x, y, dims[0], dims[1])
-                    min_landing_z = min(min_landing_z, landing_z + dims[2])
+                landing_z = get_valid_z(dims, x, y)
+                if landing_z != -1:
+                    top_z = landing_z + dims[2]
+                    if top_z < min_landing_z:
+                        min_landing_z = top_z
+                        if min_landing_z < best_score:
+                            break
+            if min_landing_z < best_score:
+                break
 
         if PALLET_DIMS[2] + 100 > min_landing_z >= best_score:
             counter_bound4.update(1)
@@ -1780,15 +1882,16 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
 
         candidate_placements = []                                                                           # Make list of valid placement candidates to loop through
         for dims in orientations:
+            dz = dims[2]
             for x, y in sorted_extpts:
-                if pallet.check_box_placement_validity(dims, x, y):
-                    landing_z = pallet.get_max_height_in_area(x, y, dims[0], dims[1])
-                    top_z     = landing_z + dims[2]
+                landing_z = get_valid_z(dims, x, y)
+                if landing_z != -1:
+                    top_z     = landing_z + dz
                     score     = (top_z, x + y)
-                    candidate_placements.append((score, dims, x, y))
+                    candidate_placements.append((score, dims, x, y, landing_z))
 
         if not use_guarantee and num_extpts_to_try is not None:                                             # Filter 5 (Top-X candidates): if optimality need not be guaranteed and candidate limit is specified, score all orientation + placement candidates by resultant box height, then lowest x+y placement, and only branch on the top X scoring candidates
-            candidate_placements.sort(key=lambda c: c[0])
+            candidate_placements.sort(key=_FIRST_ITEM)
             candidate_placements_filtered = max(0, len(candidate_placements) - num_extpts_to_try)
             candidate_placements = candidate_placements[:num_extpts_to_try]
             if candidate_placements_filtered > 0:
@@ -1796,9 +1899,8 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
                 count_filt5 += candidate_placements_filtered
 
         # Iterate through valid candidate placements, attempt to place box, and recurse after each valid placement
-        for _, dims, x, y in candidate_placements:
+        for _, dims, x, y, z in candidate_placements:
             if not use_guarantee:                                                                           # Filter 1 (Deduplication): if optimality need not be guaranteed, check if placing the box in the same orientation at another extreme point leads to the same resultant z-height. This is likely to lead to a very similar heightmap structure, so prune all these candidate branches except for one representative. 
-                z = pallet.get_max_height_in_area(x, y, dims[0], dims[1])
                 profile_key = (dims, z)
                 if profile_key in seen_profile_keys:
                     counter_filt1.update(1)
@@ -2018,8 +2120,9 @@ def place_box_list_branch_and_bound_mc(pallet, box_list, criterion=DEFAULT_CRITE
             seed_counts['pruned_rule1'] += 1
             continue
 
+        r4_early_exit = cur_max_z if cur_max_z < r4_limit else (r4_limit - 1)
         min_landing_z = int(_bnb_compute_rule4_min_z(
-            seed_pallet, tallest_remaining_orientations[b_idx]
+            seed_pallet, tallest_remaining_orientations[b_idx], r4_early_exit
         ))
         if size_z_plus_100 > min_landing_z >= r4_limit:
             seed_counts['pruned_rule4'] += 1
