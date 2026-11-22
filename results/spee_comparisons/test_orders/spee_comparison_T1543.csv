@@ -1,0 +1,9 @@
+order_id,order_label,implementation,cores,seconds,speedup_vs_single_core,metric,metric_value,max_z,box_count,nodes,pruned_rule1,pruned_rule4,pruned_filt1,pruned_filt2,pruned_filt5,matches_single_core,boxes_match,heightmap_match,max_z_match
+1543,T1543,single_core,1,0.007222207,1.0,maxz,220.0,220,15,60,28,2,23,67,1161,True,True,True,True
+1543,T1543,multi_core,2,0.021866606082767248,0.33028477179600885,maxz,220.0,220,15,72,28,4,37,76,1524,True,True,True,True
+1543,T1543,multi_core,4,0.03200061502866447,0.22568963107523796,maxz,220.0,220,15,87,37,4,43,86,1809,True,True,True,True
+1543,T1543,multi_core,8,0.0464415920432657,0.15551161539147237,maxz,220.0,220,15,150,60,8,63,176,3366,True,True,True,True
+1543,T1543,multi_core,16,0.09040195611305535,0.07988994166197039,maxz,220.0,220,15,89,39,4,41,95,1704,True,True,True,True
+1543,T1543,multi_core,32,0.007069120882079005,1.0216556090176763,maxz,220.0,220,15,60,28,2,23,67,1161,True,True,True,True
+1543,T1543,multi_core,64,0.006662377854809165,1.084028429097087,maxz,220.0,220,15,60,28,2,23,67,1161,True,True,True,True
+1543,T1543,multi_core,128,0.0068727650213986635,1.0508444530714105,maxz,220.0,220,15,60,28,2,23,67,1161,True,True,True,True
