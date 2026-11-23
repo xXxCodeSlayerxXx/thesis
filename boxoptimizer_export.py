@@ -84,6 +84,7 @@ BNB_OPTIMALITY_GUARANTEE        = False                                         
 DEFAULT_MAX_ATTEMPTS            = 2000                                          # Default cutoff for random attempts to place boxes
 SUPPORTED_AREA_PERCENTAGE       = 70                                            # Percentage of pallet area that must be supported under a box for it to be placed
 BNB_TOPX_DEFAULT_LIMIT          = 5                                             # Default limit amount for BnB Filter 5
+BNB_WARMSTART_MAX_NODES         = 500000                                        # Node cap for fast inexact BnB warm-start when optimality_guarantee=True
 BNB_MC_MIN_SPLIT_REMAINING      = 2                                             # Multi-core BnB: only donate subtrees with at least this many boxes left to place
 BNB_MC_MAX_DONATE_PER_SPLIT     = 8                                             # Multi-core BnB: maximum sibling tasks donated in a single work-splitting burst
 
@@ -966,6 +967,137 @@ def _bnb_spikes_disproved_by_front(spikes, cert_front):
     """Return True iff `cert_front` already proves an ancestor spike was pruned by Rule 4."""
     return _bnb_first_disproved_spike_depth(spikes, cert_front) is not None
 
+def _bnb_build_reachable_height_table(sorted_box_list, box_orientations_dict, max_h, initial_heights=(0,)):
+    """Compute achievable stack heights <= `max_h` via 1D bitmask subset-sum DP.
+
+    Any final `max_z` on a pallet starting from `initial_heights` must equal some
+    initial height plus a sum of allowed `dz` values of a subset of boxes in
+    `sorted_box_list`. Returns `(reachable_mask, prev_reachable)` where
+    `prev_reachable[s]` is the largest reachable height strictly less than `s`
+    (for `0 <= s <= max_h + 1`), or `-1` if none exists.
+    """
+    if max_h < 0:
+        return 0, [-1]
+
+    mask = (1 << (max_h + 1)) - 1
+    dp = 0
+    for h0 in initial_heights:
+        if 0 <= h0 <= max_h:
+            dp |= (1 << int(h0))
+
+    for boxid in sorted_box_list:
+        dzs = {dims[2] for dims in box_orientations_dict[boxid] if 0 < dims[2] <= max_h}
+        if not dzs:
+            continue
+        new_dp = dp
+        for dz in dzs:
+            new_dp |= (dp << dz)
+        dp = new_dp & mask
+
+    prev_reachable = [-1] * (max_h + 2)
+    last_h = -1
+    for h in range(max_h + 2):
+        prev_reachable[h] = last_h
+        if h <= max_h and ((dp >> h) & 1):
+            last_h = h
+
+    return dp, prev_reachable
+
+def _bnb_heuristic_warmstart(pallet_dims, sorted_box_list, box_orientations_dict,
+                             tallest_remaining_orientations, dimension_tuples,
+                             initial_best_score, initial_best_sequence,
+                             max_nodes=BNB_WARMSTART_MAX_NODES,
+                             top_x=BNB_TOPX_DEFAULT_LIMIT, root_lb=0):
+    """Fast node-capped inexact BnB warm-start (top-X + dedup) to tighten `best_score`."""
+    n_boxes = len(sorted_box_list)
+    if (
+        max_nodes <= 0
+        or n_boxes == 0
+        or (initial_best_sequence is not None and initial_best_score <= root_lb)
+    ):
+        return initial_best_score, initial_best_sequence
+
+    warm_pallet = Pallet(dims=pallet_dims)
+    size_z_plus_100 = pallet_dims[2] + 100
+    best_score = initial_best_score
+    best_sequence = initial_best_sequence
+    cur_seq = []
+    nodes_used = 0
+
+    def dfs(box_index):
+        nonlocal best_score, best_sequence, nodes_used
+        if nodes_used >= max_nodes or (best_sequence is not None and best_score <= root_lb):
+            return
+
+        if box_index == n_boxes:
+            sc = int(warm_pallet.get_max_height())
+            if sc < best_score:
+                best_score = sc
+                best_sequence = list(cur_seq)
+            return
+
+        if warm_pallet.get_max_height() >= best_score:
+            return
+
+        min_landing_z = _bnb_compute_rule4_min_z(
+            warm_pallet, tallest_remaining_orientations[box_index], best_score - 1
+        )
+        if size_z_plus_100 > min_landing_z >= best_score:
+            return
+
+        boxid = sorted_box_list[box_index]
+        orientations = box_orientations_dict[boxid]
+        sorted_extpts = sorted(warm_pallet.extpts)
+        symmetry_key = (
+            cur_seq[-1]
+            if box_index > 0 and dimension_tuples[box_index] == dimension_tuples[box_index - 1]
+            else None
+        )
+        get_valid_z = warm_pallet.get_valid_placement_z
+
+        cands = []
+        for dims in orientations:
+            dz = dims[2]
+            if dz >= best_score:
+                continue
+            for x, y in sorted_extpts:
+                landing_z = get_valid_z(dims, x, y)
+                if landing_z != -1:
+                    top_z = landing_z + dz
+                    if top_z < best_score:
+                        cands.append(((top_z, x + y), dims, x, y, landing_z))
+
+        cands.sort(key=_FIRST_ITEM)
+        if top_x is not None:
+            cands = cands[:top_x]
+
+        seen_profile_keys = set()
+        for _, dims, x, y, landing_z in cands:
+            if nodes_used >= max_nodes or (best_sequence is not None and best_score <= root_lb):
+                return
+            if landing_z + dims[2] >= best_score:
+                break
+
+            profile_key = (dims, landing_z)
+            if profile_key in seen_profile_keys:
+                continue
+            if symmetry_key is not None and symmetry_key > (dims, x, y):
+                continue
+
+            delta = warm_pallet.place_box(dims, x, y)
+            if not delta:
+                continue
+
+            seen_profile_keys.add(profile_key)
+            cur_seq.append((dims, x, y))
+            nodes_used += 1
+            dfs(box_index + 1)
+            cur_seq.pop()
+            warm_pallet.remove_box(delta)
+
+    dfs(0)
+    return best_score, best_sequence
+
 def _bnb_compute_rule4_min_z(pallet, tallest_orientations, early_exit_threshold=-1):
     """Exact Rule 4 (tall-low) minimum landing height matching single-core BnB.
 
@@ -1801,10 +1933,8 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
     use_guarantee = BNB_OPTIMALITY_GUARANTEE if optimality_guarantee is None else optimality_guarantee      # Override global optimality guarantee if specified
     current_sequence = []                                                                                   # Initialize a list of deltas for the current sequence of placements to traverse both ways
     best_sequence = None                                                                                    # Initialize storage for the best sequence of placements found
-
-    temp_pallet = Pallet()                                                                                  # Initialize best score tracker for the entire placement
-    place_box_list_best_fit_decreasing(temp_pallet, sorted_box_list, criterion=criterion)                   # Run the BFD algorithm first to get a decent initial score to beat, making pruning more aggressive
-    best_score = temp_pallet.get_max_height() + 1                                                           # Make sure BnB algorithm doesn't fail catastrophically if unable to find a better solution than BFD
+    pallet_dims = (pallet.size_x, pallet.size_y, pallet.size_z)
+    size_z_plus_100 = pallet.size_z + 100
 
     box_count = len(box_list)
     node_count_estimate = 139828400000 + (4413.08 - 139828400000) / (1 + (box_count/210.6191) ** 7.855901)  # Equation derived from curve fitting average BnB node counts per box amount
@@ -1813,7 +1943,10 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
     box_orientations_dict = {}                                                                              # Precalculate box orientations for this order
     for boxid in set(sorted_box_list):
         dx, dy, dz, _, _ = get_box_properties_from_id(boxid)
-        box_orientations_dict[boxid] = get_box_orientations(dx, dy, dz)
+        orients = get_box_orientations(dx, dy, dz)
+        if use_guarantee:
+            orients = sorted(orients, key=lambda o: (o[2], o[0], o[1]))                                     # Deterministic flattest-first ordering for exact search
+        box_orientations_dict[boxid] = orients
     
     tallest_remaining_orientations = []                                                                     # Rule 4 (Tall-Low): Precalculate tallest remaining box orientations by depth
     for i in range(len(sorted_box_list)):
@@ -1827,9 +1960,73 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
     for boxid in sorted_box_list:
         dimension_tuples.append(tuple(sorted(get_box_properties_from_id(boxid)[:3])))
 
+    # WARM-START & EXACT TARGET TIGHTENING
+    temp_pallet = Pallet(dims=pallet_dims)                                                                  # Initialize best score tracker for the entire placement
+    place_box_list_best_fit_decreasing(temp_pallet, sorted_box_list, criterion=criterion)                   # Run the BFD algorithm first to get a decent initial score to beat, making pruning more aggressive
+
+    root_lb = 0
+    prev_reachable = None
+    max_reachable_h = -1
+
+    if use_guarantee:
+        # Preserve the complete BFD sequence directly so exact BnB starts at `best_score` without +1 slack
+        if len(temp_pallet.boxes) == len(sorted_box_list):
+            best_score = int(temp_pallet.get_max_height())
+            best_sequence = [
+                ((b['dx'], b['dy'], b['dz']), b['x'], b['y'])
+                for b in temp_pallet.boxes
+            ]
+        else:
+            best_score = pallet.size_z + 1
+
+        # Admissible root lower bound: max(tallest box minimum height, ceil(total box volume / pallet area))
+        if sorted_box_list:
+            max_min_dz = max(
+                min(dims[2] for dims in box_orientations_dict[bid])
+                for bid in set(sorted_box_list)
+            )
+            total_box_volume = sum(get_box_properties_from_id(bid)[4] for bid in sorted_box_list)
+            pallet_area = pallet.size_x * pallet.size_y
+            volume_lb = (total_box_volume + pallet_area - 1) // pallet_area if pallet_area > 0 else 0
+            raw_lb = max(max_min_dz, volume_lb)
+        else:
+            raw_lb = 0
+
+        # Precompute discrete reachable stack heights (1D subset-sum DP) for O(1) target ceiling tightening
+        max_reachable_h = min(pallet.size_z, best_score)
+        init_heights = tuple({0} | {r[4] for r in pallet._box_rects}) if pallet._box_rects else (0,)
+        reachable_mask, prev_reachable = _bnb_build_reachable_height_table(
+            sorted_box_list, box_orientations_dict, max_reachable_h, initial_heights=init_heights
+        )
+
+        # Round raw_lb up to the smallest actually achievable stack height >= raw_lb
+        root_lb = raw_lb
+        while root_lb <= max_reachable_h and not ((reachable_mask >> root_lb) & 1):
+            root_lb += 1
+
+        # Fast node-capped inexact BnB warm-start (top-X + dedup) to tighten incumbent before exact search
+        if sorted_box_list and (best_sequence is None or best_score > root_lb):
+            best_score, best_sequence = _bnb_heuristic_warmstart(
+                pallet_dims,
+                sorted_box_list,
+                box_orientations_dict,
+                tallest_remaining_orientations,
+                dimension_tuples,
+                best_score,
+                best_sequence,
+                max_nodes=BNB_WARMSTART_MAX_NODES,
+                top_x=BNB_TOPX_DEFAULT_LIMIT,
+                root_lb=root_lb,
+            )
+    else:
+        best_score = temp_pallet.get_max_height() + 1                                                       # Make sure BnB algorithm doesn't fail catastrophically if unable to find a better solution than BFD
+
     def recursive_place(box_index):                                                                         # Define recursive function to place boxes one by one and prune as needed
         # Take variables into local scope of the recursive function
         nonlocal best_score, best_sequence, count_nodes, count_bound1, count_bound4, count_filt1, count_filt2, count_filt5
+
+        if use_guarantee and best_sequence is not None and best_score <= root_lb:                           # Provable global optimum already found
+            return
 
         # BASE CASE: if all boxes are placed, evaluate score and update best if needed
         if box_index == len(sorted_box_list):
@@ -1838,17 +2035,23 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
                 best_score = current_score
                 best_sequence = list(current_sequence)
             return
+
+        target_h = (
+            (prev_reachable[best_score] if best_score <= max_reachable_h + 1 else (best_score - 1))
+            if use_guarantee
+            else (best_score - 1)
+        )
         
         # BOUNDING CASES
         # Rule 1 (Trivial Rule)
-        if pallet.get_max_height() >= best_score:                                                           # Calculate if the current partial state is already worse than the best known full state and prune if so
+        if pallet.get_max_height() > target_h:                                                              # Calculate if the current partial state can no longer beat the best known full state and prune if so
             counter_bound1.update(1)
             count_bound1 += 1
             return
         
         # Rule 4 (Tall-Low)
-        t_orientations = tallest_remaining_orientations[box_index]                                          # Check if tallest remaining box placed at its lowest possible candidate position exceeds best_score and prune if so
-        min_landing_z = PALLET_DIMS[2] + 100
+        t_orientations = tallest_remaining_orientations[box_index]                                          # Check if tallest remaining box placed at its lowest possible candidate position exceeds target ceiling and prune if so
+        min_landing_z = size_z_plus_100
         get_valid_z = pallet.get_valid_placement_z
         
         for x, y in pallet.extpts:
@@ -1858,12 +2061,12 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
                     top_z = landing_z + dims[2]
                     if top_z < min_landing_z:
                         min_landing_z = top_z
-                        if min_landing_z < best_score:
+                        if min_landing_z <= target_h:
                             break
-            if min_landing_z < best_score:
+            if min_landing_z <= target_h:
                 break
 
-        if PALLET_DIMS[2] + 100 > min_landing_z >= best_score:
+        if size_z_plus_100 > min_landing_z > target_h:
             counter_bound4.update(1)
             count_bound4 += 1
             return
@@ -1875,7 +2078,7 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
 
         seen_profile_keys = set() if not use_guarantee else None                                            # Filter 1 (Deduplication): Initialize set of unique seen profiles
 
-        if dimension_tuples[box_index] == dimension_tuples[box_index - 1]:                                  # Filter 2 (Symmetry Breaking): Check if current box matches dimensions of previous box and record (dims, x, y) as comparison key
+        if box_index > 0 and dimension_tuples[box_index] == dimension_tuples[box_index - 1]:                # Filter 2 (Symmetry Breaking): Check if current box matches dimensions of previous box and record (dims, x, y) as comparison key
             symmetry_key = current_sequence[-1]
         else:
             symmetry_key = None
@@ -1883,14 +2086,24 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
         candidate_placements = []                                                                           # Make list of valid placement candidates to loop through
         for dims in orientations:
             dz = dims[2]
+            if use_guarantee and dz > target_h:                                                             # Forward-check orientation height against target ceiling before scanning extreme points
+                counter_bound1.update(1)
+                count_bound1 += 1
+                continue
             for x, y in sorted_extpts:
                 landing_z = get_valid_z(dims, x, y)
                 if landing_z != -1:
                     top_z     = landing_z + dz
+                    if use_guarantee and top_z > target_h:                                                  # Forward-check resulting top_z against target ceiling before place_box()
+                        counter_bound1.update(1)
+                        count_bound1 += 1
+                        continue
                     score     = (top_z, x + y)
                     candidate_placements.append((score, dims, x, y, landing_z))
 
-        if not use_guarantee and num_extpts_to_try is not None:                                             # Filter 5 (Top-X candidates): if optimality need not be guaranteed and candidate limit is specified, score all orientation + placement candidates by resultant box height, then lowest x+y placement, and only branch on the top X scoring candidates
+        if use_guarantee:                                                                                   # Best-first candidate ordering (lossless: keeps all candidates, explores lowest top_z first)
+            candidate_placements.sort(key=_FIRST_ITEM)
+        elif num_extpts_to_try is not None:                                                                 # Filter 5 (Top-X candidates): if optimality need not be guaranteed and candidate limit is specified, score all orientation + placement candidates by resultant box height, then lowest x+y placement, and only branch on the top X scoring candidates
             candidate_placements.sort(key=_FIRST_ITEM)
             candidate_placements_filtered = max(0, len(candidate_placements) - num_extpts_to_try)
             candidate_placements = candidate_placements[:num_extpts_to_try]
@@ -1899,7 +2112,17 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
                 count_filt5 += candidate_placements_filtered
 
         # Iterate through valid candidate placements, attempt to place box, and recurse after each valid placement
-        for _, dims, x, y, z in candidate_placements:
+        for cand_idx, (_, dims, x, y, z) in enumerate(candidate_placements):
+            if use_guarantee:
+                if best_sequence is not None and best_score <= root_lb:
+                    return
+                cur_target_h = prev_reachable[best_score] if best_score <= max_reachable_h + 1 else (best_score - 1)
+                if z + dims[2] > cur_target_h:                                                              # Sorted by top_z ascending: once exceeded, all remaining candidates also exceed cur_target_h
+                    remaining_pruned = len(candidate_placements) - cand_idx
+                    counter_bound1.update(remaining_pruned)
+                    count_bound1 += remaining_pruned
+                    break
+
             if not use_guarantee:                                                                           # Filter 1 (Deduplication): if optimality need not be guaranteed, check if placing the box in the same orientation at another extreme point leads to the same resultant z-height. This is likely to lead to a very similar heightmap structure, so prune all these candidate branches except for one representative. 
                 profile_key = (dims, z)
                 if profile_key in seen_profile_keys:
@@ -1941,10 +2164,11 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
     counter_filt1       = tqdm(desc="Number of branches filtered by deduplication",     unit=" prunes", leave=leave_tqdm)
     counter_filt2       = tqdm(desc="Number of branches filtered by symmetry breaking", unit=" prunes", leave=leave_tqdm)
     counter_filt5       = tqdm(desc="Number of branches filtered by top-x limiting",    unit=" prunes", leave=leave_tqdm)
-    recursive_place(0)
+    if not (use_guarantee and ((best_sequence is not None and best_score <= root_lb) or root_lb > pallet.size_z)):
+        recursive_place(0)
 
     # Reconstruct the optimal pallet state using the best sequence found
-    if best_sequence:
+    if best_sequence is not None:
         for dims, x, y in best_sequence:
             pallet.place_box(dims, x, y)
     else:
