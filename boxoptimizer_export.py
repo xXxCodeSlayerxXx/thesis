@@ -656,12 +656,14 @@ class Pallet:
 
             # Add BnB pruning statistics if BnB is used
             if algo == Algorithm.BNB and bnb_stats is not None:
-                total_pruned = (bnb_stats['pruned_rule1'] + bnb_stats['pruned_rule4'] + bnb_stats['pruned_filt1'] + bnb_stats['pruned_filt2'] + bnb_stats['pruned_filt5'])
+                pruned_rule2 = bnb_stats.get('pruned_rule2', 0)
+                total_pruned = (bnb_stats['pruned_rule1'] + pruned_rule2 + bnb_stats['pruned_rule4'] + bnb_stats['pruned_filt1'] + bnb_stats['pruned_filt2'] + bnb_stats['pruned_filt5'])
                 metrics_lines += [
                     "",
                     " --- BnB Search Stats -----------------",
                     f"  Branches pruned by rule:\n"
                     f"  Rule 1 (trivial):         {bnb_stats['pruned_rule1']:,}",
+                    f"  Rule 2 (clearance):       {pruned_rule2:,}",
                     f"  Rule 4 (tall-low):        {bnb_stats['pruned_rule4']:,}",
                     f"  Branches blocked by filter:\n"
                     f"  Deduplication:            {bnb_stats['pruned_filt1']:,}",
@@ -1001,33 +1003,405 @@ def get_bnb_node_count_estimate(box_count, use_guarantee=False, num_extpts_to_tr
         table = BNB_MEDIAN_NODES_BY_BOX_COUNT['inexact_topx5']
     return table.get(box_count, None)
 
-def _bnb_compute_reachable_heights_mask(sorted_box_list, box_orientations_dict, max_h, initial_heights=(0,)):
-    """Compute bitmask of achievable stack heights <= `max_h` via 1D subset-sum DP.
+def _bnb_pareto_min_wh(wh_list):
+    """Keep only Pareto-minimal `(dx, dy)` footprint pairs (removing dominated larger pairs)."""
+    uniq = sorted(set(wh_list))
+    out = []
+    for w, h in uniq:
+        if not any(w2 <= w and h2 <= h for w2, h2 in out):
+            out.append((w, h))
+    return tuple(out)
 
-    Any final `max_z` on a pallet starting from `initial_heights` must equal some
-    initial height plus a sum of allowed `dz` values of a subset of boxes in
-    `sorted_box_list`. Used once at root to round the continuous volume lower bound
-    up to the smallest actually achievable stack height.
+def _bnb_build_rule2_context(sorted_box_list, box_orientations_dict, max_h, initial_heights=(0,)):
+    """Precompute suffix metadata & lazy DP tables for Rule 2 (Coverable Stratified Clearance Bound).
+
+    Returns `(reachable_mask, prev_reachable, depth_specs, get_um, get_pwh, get_req_area)`:
+      - `reachable_mask` / `prev_reachable[s]`: O(1) discrete reachable-height target ceiling `H`.
+      - `depth_specs[i]`: tuple of stratified threshold entries for remaining boxes `sorted_box_list[i:]`
+        ordered by decreasing minimum height `t`, reusing entries across depths where `S_t` is unchanged.
+      - `get_um(entry)`: lazily constructs and caches `(u_tab, m_tab)` (1D knapsack max stack height &
+        max box stack count for every clearance `0..max_h`) on first access.
+      - `get_pwh(items_t, H)`: cached `(pareto_wh, min_w, min_h)` of valid `(dx, dy)` footprints with `dz <= H`.
+      - `get_req_area(items_t, c_max)`: cached sum of minimum feasible footprint areas for `dz <= c_max`.
     """
+    n = len(sorted_box_list)
     if max_h < 0:
-        return 0
+        return 0, [-1], [() for _ in range(n)], None, None, None
 
-    mask = (1 << (max_h + 1)) - 1
-    dp = 0
+    mask_all = (1 << (max_h + 1)) - 1
+
+    box_vol = {}
+    box_min_dz = {}
+    box_dzs = {}
+    for bid in set(sorted_box_list):
+        box_vol[bid] = get_box_properties_from_id(bid)[4]
+        orients = box_orientations_dict[bid]
+        box_min_dz[bid] = min(o[2] for o in orients)
+        box_dzs[bid] = tuple(sorted({o[2] for o in orients if 0 < o[2] <= max_h}))
+
+    # 1D bitmask subset-sum DP for all achievable stack heights <= max_h
+    dp_all = 0
     for h0 in initial_heights:
         if 0 <= h0 <= max_h:
-            dp |= (1 << int(h0))
+            dp_all |= (1 << int(h0))
+    for bid in sorted_box_list:
+        ndp = dp_all
+        for dz in box_dzs[bid]:
+            ndp |= (dp_all << dz)
+        dp_all = ndp & mask_all
 
-    for boxid in sorted_box_list:
-        dzs = {dims[2] for dims in box_orientations_dict[boxid] if 0 < dims[2] <= max_h}
-        if not dzs:
+    prev_reachable = [-1] * (max_h + 2)
+    last_h = -1
+    bits = dp_all
+    for h in range(max_h + 2):
+        prev_reachable[h] = last_h
+        if bits & 1:
+            last_h = h
+        bits >>= 1
+
+    # Incremental right-to-left suffix stratified metadata, sharing unchanged entries across depths
+    all_thresholds = sorted({box_min_dz[bid] for bid in sorted_box_list}, reverse=True)
+    dp_by_t = {t: 1 for t in all_thresholds}
+    vol_by_t = {t: 0 for t in all_thresholds}
+    cnts_by_t = {t: {} for t in all_thresholds}
+    min_ds_by_t = {t: [] for t in all_thresholds}
+    has_exact_t = {t: False for t in all_thresholds}
+    entry_by_t = {t: None for t in all_thresholds}
+
+    depth_specs = [None] * n
+    for i in range(n - 1, -1, -1):
+        bid = sorted_box_list[i]
+        md = box_min_dz[bid]
+        bv = box_vol[bid]
+        bdzs = box_dzs[bid]
+        has_exact_t[md] = True
+        specs_i = []
+        for t in all_thresholds:
+            if md >= t:
+                vol_by_t[t] += bv
+                cnts_by_t[t][bid] = cnts_by_t[t].get(bid, 0) + 1
+                min_ds_by_t[t].append(md)
+                ndp = dp_by_t[t]
+                for dz in bdzs:
+                    ndp |= (dp_by_t[t] << dz)
+                dp_by_t[t] = ndp & mask_all
+                # Entry: [t, req_vol, dp_t, sorted_mds, items_t, u_tab, m_tab]
+                entry_by_t[t] = [
+                    t,
+                    vol_by_t[t],
+                    dp_by_t[t],
+                    tuple(sorted(min_ds_by_t[t])),
+                    tuple(sorted(cnts_by_t[t].items())),
+                    None,
+                    None,
+                ]
+            if has_exact_t[t]:
+                specs_i.append(entry_by_t[t])
+        depth_specs[i] = tuple(specs_i)
+
+    pwh_cache = {}
+    min_area_cache = {}
+
+    def get_um(entry):
+        u_tab = entry[5]
+        if u_tab is not None:
+            return u_tab, entry[6]
+        dp_t = entry[2]
+        u_tab = [0] * (max_h + 1)
+        lh = 0
+        bt = dp_t
+        for c in range(max_h + 1):
+            if bt & 1:
+                lh = c
+            u_tab[c] = lh
+            bt >>= 1
+        mds = entry[3]
+        m_tab = [0] * (max_h + 1)
+        s_m = 0
+        c_m = 0
+        idx_m = 0
+        nm = len(mds)
+        for c in range(max_h + 1):
+            while idx_m < nm and s_m + mds[idx_m] <= c:
+                s_m += mds[idx_m]
+                c_m += 1
+                idx_m += 1
+            m_tab[c] = c_m
+        entry[5] = u_tab
+        entry[6] = m_tab
+        return u_tab, m_tab
+
+    def get_pwh(items_t, target_h):
+        k = (items_t, target_h)
+        v = pwh_cache.get(k)
+        if v is not None:
+            return v
+        whs = []
+        for bid, _ in items_t:
+            for dx, dy, dz in box_orientations_dict[bid]:
+                if dz <= target_h:
+                    whs.append((dx, dy))
+        pwh = _bnb_pareto_min_wh(whs)
+        if pwh:
+            res = (pwh, min(w for w, _ in pwh), min(h for _, h in pwh))
+        else:
+            res = ((), 10**9, 10**9)
+        pwh_cache[k] = res
+        return res
+
+    def get_req_area(items_t, c_max):
+        k = (items_t, c_max)
+        v = min_area_cache.get(k)
+        if v is not None:
+            return v
+        tot = 0
+        for bid, cnt in items_t:
+            ba = None
+            for dx, dy, dz in box_orientations_dict[bid]:
+                if dz <= c_max:
+                    a = dx * dy
+                    if ba is None or a < ba:
+                        ba = a
+            if ba is None:
+                min_area_cache[k] = 10**18
+                return 10**18
+            tot += cnt * ba
+        min_area_cache[k] = tot
+        return tot
+
+    return dp_all, prev_reachable, depth_specs, get_um, get_pwh, get_req_area
+
+def _bnb_check_rule2_clearance(pallet, box_index, target_h, depth_specs, get_um, get_pwh, get_req_area):
+    """Exact Rule 2 (Coverable Stratified Clearance Bound). Returns True iff no completion <= `target_h` exists.
+
+    100% admissible and strictly monotonic under arbitrary future placements and 70% support:
+      - Builds an exact coordinate-compressed heightmap from `pallet._box_rects`.
+      - For each remaining minimum-height tier `t`, isolates pixels with clearance `target_h - h >= t`.
+      - Computes the exact 2D coverability mask via O(nx * ny) Maximal Empty Rectangles (eliminating
+        dead edge strips and narrow pockets that cannot contain any valid orientation in `S_t`).
+      - Checks both 1D-knapsack-capped usable volume and discrete layer-count footprint area over the
+        coverable cells in a single fused prefix-sum pass.
+    """
+    specs = depth_specs[box_index]
+    if not specs:
+        return False
+    if specs[0][0] > target_h:
+        return True
+
+    rects = pallet._box_rects
+    cur_max_z = pallet.max_z
+    size_x = pallet.size_x
+    size_y = pallet.size_y
+
+    if not rects:
+        pallet_area = size_x * size_y
+        for entry in specs:
+            u_tab, m_tab = get_um(entry)
+            if pallet_area * u_tab[target_h] < entry[1]:
+                return True
+            if pallet_area * m_tab[target_h] < get_req_area(entry[4], target_h):
+                return True
+        return False
+
+    # Build exact coordinate-compressed grid + precomputed clearance & area rows once per node
+    xs_set = {0, size_x}
+    ys_set = {0, size_y}
+    for bx, by, bx2, by2, _ in rects:
+        xs_set.add(bx)
+        xs_set.add(bx2)
+        ys_set.add(by)
+        ys_set.add(by2)
+    xs = sorted(xs_set)
+    ys = sorted(ys_set)
+    nx = len(xs) - 1
+    ny = len(ys) - 1
+    x_idx = {v: i for i, v in enumerate(xs)}
+    y_idx = {v: j for j, v in enumerate(ys)}
+    dx_arr = [xs[i + 1] - xs[i] for i in range(nx)]
+    dy_arr = [ys[j + 1] - ys[j] for j in range(ny)]
+
+    grid = [[0] * ny for _ in range(nx)]
+    for bx, by, bx2, by2, btop in rects:
+        ix1 = x_idx[bx]
+        ix2 = x_idx[bx2]
+        iy1 = y_idx[by]
+        iy2 = y_idx[by2]
+        for ix in range(ix1, ix2):
+            row = grid[ix]
+            for iy in range(iy1, iy2):
+                if btop > row[iy]:
+                    row[iy] = btop
+
+    clr_grid = [[target_h - h for h in row] for row in grid]
+    area_grid = [[wx * dy for dy in dy_arr] for wx in dx_arr]
+
+    last_ok_sig = None
+    last_pwh = None
+    last_cov = None
+
+    for entry in specs:
+        t = entry[0]
+        req_vol = entry[1]
+        items_t = entry[4]
+        u_tab, m_tab = get_um(entry)
+
+        # Fast path: every cell on the pallet has clearance >= t (entire pallet is one coverable rectangle)
+        if cur_max_z <= target_h - t:
+            avail_vol = 0
+            avail_la = 0
+            max_clr = 0
+            for i in range(nx):
+                ci = clr_grid[i]
+                ai = area_grid[i]
+                for j in range(ny):
+                    clr = ci[j]
+                    if clr > max_clr:
+                        max_clr = clr
+                    a = ai[j]
+                    avail_vol += a * u_tab[clr]
+                    avail_la += a * m_tab[clr]
+            if avail_vol < req_vol or avail_la < get_req_area(items_t, max_clr):
+                return True
             continue
-        new_dp = dp
-        for dz in dzs:
-            new_dp |= (dp << dz)
-        dp = new_dp & mask
 
-    return dp
+        # Build compact per-row bitmask of cells with clearance >= t
+        row_masks = [0] * nx
+        any_ok = False
+        for i in range(nx):
+            ci = clr_grid[i]
+            rm = 0
+            bit = 1
+            for j in range(ny):
+                if ci[j] >= t:
+                    rm |= bit
+                bit <<= 1
+            if rm:
+                row_masks[i] = rm
+                any_ok = True
+        if not any_ok:
+            return True
+
+        pwh, min_rw, min_rh = get_pwh(items_t, target_h)
+        if not pwh:
+            return True
+
+        ok_sig = tuple(row_masks)
+        if ok_sig == last_ok_sig and pwh == last_pwh:
+            # Consecutive threshold produced identical (ok_mask, pwh): reuse coverability bitmasks
+            cov = last_cov
+            avail_vol = 0
+            avail_la = 0
+            max_clr = 0
+            for i in range(nx):
+                cm = cov[i]
+                if not cm:
+                    continue
+                ci = clr_grid[i]
+                ai = area_grid[i]
+                j = 0
+                while cm:
+                    if cm & 1:
+                        clr = ci[j]
+                        if clr > max_clr:
+                            max_clr = clr
+                        a = ai[j]
+                        avail_vol += a * u_tab[clr]
+                        avail_la += a * m_tab[clr]
+                    cm >>= 1
+                    j += 1
+            if avail_vol < req_vol or avail_la < get_req_area(items_t, max_clr):
+                return True
+            continue
+
+        # Exact O(nx * ny) Maximal Empty Rectangle (MER) histogram stack -> 2D difference array
+        heights = [0] * (ny + 1)
+        diff = [[0] * (ny + 1) for _ in range(nx + 1)]
+        any_fits = False
+        for i in range(nx):
+            rm = row_masks[i]
+            if rm:
+                for j in range(ny):
+                    heights[j] = heights[j] + 1 if ((rm >> j) & 1) else 0
+            else:
+                for j in range(ny):
+                    heights[j] = 0
+            stack = []
+            for j in range(ny + 1):
+                h_cur = heights[j]
+                start_j = j
+                while stack and stack[-1][1] > h_cur:
+                    sj, sh = stack.pop()
+                    r1 = i - sh + 1
+                    r2 = i + 1
+                    w_mm = xs[r2] - xs[r1]
+                    if w_mm >= min_rw:
+                        h_mm = ys[j] - ys[sj]
+                        if h_mm >= min_rh:
+                            for rw, rh in pwh:
+                                if w_mm >= rw and h_mm >= rh:
+                                    any_fits = True
+                                    diff[r1][sj] += 1
+                                    diff[r2][sj] -= 1
+                                    diff[r1][j] -= 1
+                                    diff[r2][j] += 1
+                                    break
+                    start_j = sj
+                if h_cur > 0 and (not stack or stack[-1][1] < h_cur):
+                    stack.append((start_j, h_cur))
+
+        if not any_fits:
+            return True
+
+        # Fused 2D prefix-sum + coverable bitmask + usable volume + usable layer-area in one pass
+        cov_masks = [0] * nx
+        avail_vol = 0
+        avail_la = 0
+        max_clr = 0
+        for i in range(nx):
+            di = diff[i]
+            di_prev = diff[i - 1] if i > 0 else None
+            ci = clr_grid[i]
+            ai = area_grid[i]
+            cm = 0
+            bit = 1
+            row_acc = 0
+            if di_prev is None:
+                for j in range(ny):
+                    row_acc += di[j]
+                    di[j] = row_acc
+                    if row_acc > 0:
+                        cm |= bit
+                        clr = ci[j]
+                        if clr > max_clr:
+                            max_clr = clr
+                        a = ai[j]
+                        avail_vol += a * u_tab[clr]
+                        avail_la += a * m_tab[clr]
+                    bit <<= 1
+            else:
+                for j in range(ny):
+                    row_acc += di[j]
+                    val = row_acc + di_prev[j]
+                    di[j] = val
+                    if val > 0:
+                        cm |= bit
+                        clr = ci[j]
+                        if clr > max_clr:
+                            max_clr = clr
+                        a = ai[j]
+                        avail_vol += a * u_tab[clr]
+                        avail_la += a * m_tab[clr]
+                    bit <<= 1
+            cov_masks[i] = cm
+
+        last_ok_sig = ok_sig
+        last_pwh = pwh
+        last_cov = cov_masks
+
+        if avail_vol < req_vol or avail_la < get_req_area(items_t, max_clr):
+            return True
+
+    return False
 
 def _bnb_heuristic_warmstart(pallet_dims, sorted_box_list, box_orientations_dict,
                              tallest_remaining_orientations, dimension_tuples,
@@ -1993,6 +2367,12 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
     place_box_list_best_fit_decreasing(temp_pallet, sorted_box_list, criterion=criterion)                   # Run the BFD algorithm first to get a decent initial score to beat, making pruning more aggressive
 
     root_lb = 0
+    max_reachable_h = -1
+    prev_reachable = None
+    rule2_depth_specs = None
+    rule2_get_um = None
+    rule2_get_pwh = None
+    rule2_get_req_area = None
 
     if use_guarantee:
         # Preserve the complete BFD sequence directly so exact BnB starts at `best_score` without +1 slack
@@ -2005,8 +2385,7 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
         else:
             best_score = pallet.size_z + 1
 
-        # Admissible root lower bound: max(tallest box minimum height, ceil(total box volume / pallet area)),
-        # rounded up once at root to the smallest actually achievable stack height
+        # Admissible raw lower bound: max(tallest box minimum height, ceil(total box volume / pallet area))
         if n_boxes > 0:
             max_min_dz = max(
                 min(dims[2] for dims in box_orientations_dict[bid])
@@ -2016,18 +2395,11 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
             pallet_area = pallet.size_x * pallet.size_y
             volume_lb = (total_box_volume + pallet_area - 1) // pallet_area if pallet_area > 0 else 0
             raw_lb = max(max_min_dz, volume_lb)
+        else:
+            raw_lb = 0
 
-            max_reachable_h = min(pallet.size_z, best_score)
-            init_heights = tuple({0} | {r[4] for r in pallet._box_rects}) if pallet._box_rects else (0,)
-            reachable_mask = _bnb_compute_reachable_heights_mask(
-                sorted_box_list, box_orientations_dict, max_reachable_h, initial_heights=init_heights
-            )
-            root_lb = raw_lb
-            while root_lb <= max_reachable_h and not ((reachable_mask >> root_lb) & 1):
-                root_lb += 1
-
-        # Fast node-capped inexact BnB warm-start (top-X + dedup) to tighten incumbent before exact search
-        if n_boxes > 0 and (best_sequence is None or best_score > root_lb):
+        # Fast node-capped inexact BnB warm-start (top-X + dedup) BEFORE Rule 2 precalc so max_h is already tight
+        if n_boxes > 0 and (best_sequence is None or best_score > raw_lb):
             best_score, best_sequence = _bnb_heuristic_warmstart(
                 pallet_dims,
                 sorted_box_list,
@@ -2038,15 +2410,33 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
                 best_sequence,
                 max_nodes=BNB_WARMSTART_MAX_NODES,
                 top_x=BNB_TOPX_DEFAULT_LIMIT,
-                root_lb=root_lb,
+                root_lb=raw_lb,
             )
+
+        # Build Rule 2 (Coverable Stratified Clearance Bound) context & reachable-height table once at tightened max_h
+        if n_boxes > 0:
+            max_reachable_h = min(pallet.size_z, best_score)
+            init_heights = tuple({0} | {r[4] for r in pallet._box_rects}) if pallet._box_rects else (0,)
+            (
+                reachable_mask,
+                prev_reachable,
+                rule2_depth_specs,
+                rule2_get_um,
+                rule2_get_pwh,
+                rule2_get_req_area,
+            ) = _bnb_build_rule2_context(
+                sorted_box_list, box_orientations_dict, max_reachable_h, initial_heights=init_heights
+            )
+            root_lb = raw_lb
+            while root_lb <= max_reachable_h and not ((reachable_mask >> root_lb) & 1):
+                root_lb += 1
     else:
         best_score = temp_pallet.get_max_height() + 1                                                       # Make sure BnB algorithm doesn't fail catastrophically if unable to find a better solution than BFD
 
     get_valid_z = pallet.get_valid_placement_z
 
-    def recursive_place_exact(box_index):                                                                   # Branch-free exact recursion (optimality_guarantee=True): direct iteration + forward-checking + root_lb early stop
-        nonlocal best_score, best_sequence, count_nodes, count_bound1, count_bound4, count_filt2
+    def recursive_place_exact(box_index):                                                                   # Branch-free exact recursion (optimality_guarantee=True): Rule 1 + Rule 2 (Coverable Stratified Clearance Bound) + direct iteration
+        nonlocal best_score, best_sequence, count_nodes, count_bound1, count_bound2, count_filt2
 
         if best_sequence is not None and best_score <= root_lb:                                             # Provable global optimum already found
             return
@@ -2058,31 +2448,23 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
                 best_sequence = list(current_sequence)
             return
 
+        target_h = prev_reachable[best_score] if best_score <= max_reachable_h + 1 else (best_score - 1)
+
         # Rule 1 (Trivial Rule)
-        if pallet.get_max_height() >= best_score:
+        if pallet.get_max_height() > target_h:
             counter_bound1.update(1)
             count_bound1 += 1
             return
 
-        # Rule 4 (Tall-Low)
-        t_orientations = tallest_remaining_orientations[box_index]
-        min_landing_z = size_z_plus_100
-        for x, y in pallet.extpts:
-            for dims in t_orientations:
-                landing_z = get_valid_z(dims, x, y)
-                if landing_z != -1:
-                    top_z = landing_z + dims[2]
-                    if top_z < min_landing_z:
-                        min_landing_z = top_z
-                        if min_landing_z < best_score:
-                            break
-            if min_landing_z < best_score:
-                break
-
-        if size_z_plus_100 > min_landing_z >= best_score:
-            counter_bound4.update(1)
-            count_bound4 += 1
-            return
+        # Rule 2 (Coverable Stratified Clearance Bound: strictly monotonic & subsumes Rule 4 in exact mode)
+        if box_index < n_boxes - 1:
+            if _bnb_check_rule2_clearance(
+                pallet, box_index, target_h,
+                rule2_depth_specs, rule2_get_um, rule2_get_pwh, rule2_get_req_area
+            ):
+                counter_bound2.update(1)
+                count_bound2 += 1
+                return
 
         # Direct branching over flattest-first orientations and sorted extreme points (zero list/sort allocation)
         orientations = box_orientations_dict[sorted_box_list[box_index]]
@@ -2250,6 +2632,7 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
     # Initialize non-tqdm counters for nodes and pruning for metrics extraction
     count_nodes         = 0
     count_bound1        = 0
+    count_bound2        = 0
     count_bound4        = 0
     count_filt1         = 0
     count_filt2         = 0
@@ -2259,6 +2642,7 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
     # smoothing=0 reports the true overall average rate (n / total_elapsed) instead of an EMA
     pbar                = tqdm(desc="Evaluating Placements", unit=" nodes", leave=leave_tqdm, total=node_count_estimate, smoothing=0)
     counter_bound1      = tqdm(desc="Number of branches pruned by bounding rule 1",     unit=" prunes", leave=leave_tqdm, smoothing=0)
+    counter_bound2      = tqdm(desc="Number of branches pruned by bounding rule 2",     unit=" prunes", leave=leave_tqdm, smoothing=0)
     counter_bound4      = tqdm(desc="Number of branches pruned by bounding rule 4",     unit=" prunes", leave=leave_tqdm, smoothing=0)
     counter_filt1       = tqdm(desc="Number of branches filtered by deduplication",     unit=" prunes", leave=leave_tqdm, smoothing=0)
     counter_filt2       = tqdm(desc="Number of branches filtered by symmetry breaking", unit=" prunes", leave=leave_tqdm, smoothing=0)
@@ -2270,7 +2654,7 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
         else:
             recursive_place_heuristic(0)
     finally:
-        for bar in (pbar, counter_bound1, counter_bound4, counter_filt1, counter_filt2, counter_filt5):
+        for bar in (pbar, counter_bound1, counter_bound2, counter_bound4, counter_filt1, counter_filt2, counter_filt5):
             bar.close()
 
     # Reconstruct the optimal pallet state using the best sequence found
@@ -2284,6 +2668,7 @@ def place_box_list_branch_and_bound(pallet, box_list, criterion=DEFAULT_CRITERIO
     bnb_stats = {
         'nodes':                count_nodes,
         'pruned_rule1':         count_bound1,
+        'pruned_rule2':         count_bound2,
         'pruned_rule4':         count_bound4,
         'pruned_filt1':         count_filt1,
         'pruned_filt2':         count_filt2,

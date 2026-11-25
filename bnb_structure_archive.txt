@@ -1,4 +1,4 @@
-This is a description of the historical structure of the place_box_list_branch_and_bound() function, and an archive of all parts of it that were removed or deprecated.
+This is a description of the historical structure of the place_box_list_branch_and_bound() function at the moment of thesis submission, and an archive of all parts of it that were removed or deprecated.
 
 STRUCTURAL SUMMARY (# for deprecated code):
 
